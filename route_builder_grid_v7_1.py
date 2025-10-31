@@ -26,6 +26,10 @@ from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, P
 from shapely.ops import unary_union
 from tqdm import tqdm
 import xml.etree.ElementTree as ET
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env")
 
 # ---------------------------------------------------------------------------
 # Configuration parameters – tweak here to adjust behaviour globally.

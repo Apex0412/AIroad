@@ -8,6 +8,7 @@ from typing import Dict
 
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from flask_socketio import SocketIO, emit
+from dotenv import load_dotenv
 
 from route_builder_grid_v7_1 import (
     CENTER_LAT,
@@ -19,6 +20,7 @@ from route_builder_grid_v7_1 import (
 )
 
 APP_ROOT = Path(__file__).parent.resolve()
+load_dotenv(APP_ROOT / ".env")
 GEO_PATH = APP_ROOT / "GEO.kml"
 ROADS_PATH = APP_ROOT / "RoadCity.kml"
 ASSIGNMENTS_PATH = APP_ROOT / "assignments.json"

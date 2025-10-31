@@ -148,12 +148,12 @@
         <div class="info-box">
           <strong>Google Directions API</strong>
           <p style="margin: 6px 0 0;">
-            Перед запуском сервера установите ключ в переменную окружения
-            <code>GOOGLE_API_KEY</code>.
+            Перед запуском сервера создайте файл <code>.env</code> в корне проекта и
+            добавьте строку <code>GOOGLE_API_KEY=ВАШ_КЛЮЧ</code>.
           </p>
           <p style="margin: 6px 0 0;">
-            Linux / macOS: <code>export GOOGLE_API_KEY="ВАШ_КЛЮЧ"</code><br />
-            Windows PowerShell: <code>$Env:GOOGLE_API_KEY = "ВАШ_КЛЮЧ"</code>
+            Быстрый старт: <code>cp .env.example .env</code>, затем отредактируйте
+            файл и вставьте ключ.
           </p>
           {% if google_key_present %}
           <p style="margin: 6px 0 0; color: #1b5e20; font-weight: 600;">Ключ обнаружен на сервере.</p>
