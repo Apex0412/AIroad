@@ -89,9 +89,12 @@ def read_geojson_grid_cells() -> Optional[int]:
     try:
         data = json.loads(SECTORS_GEOJSON.read_text(encoding="utf-8"))
         meta = data.get("metadata", {})
-        value = int(meta.get("grid_cells"))
+        raw_value = meta.get("grid_cells")
+        if raw_value is None:
+            return None
+        value = int(raw_value)
         return value if value > 0 else None
-    except (ValueError, json.JSONDecodeError, OSError, AttributeError):
+    except (ValueError, json.JSONDecodeError, OSError, AttributeError, TypeError):
         return None
 
 
