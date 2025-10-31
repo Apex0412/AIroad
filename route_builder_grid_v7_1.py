@@ -648,18 +648,23 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     try:
         zone = parse_geo_boundary(args.geo)
-        segments = parse_roads(args.roads, zone)
         grid_cells = max(1, args.grid_cells or GRID_CELLS)
         cells = build_grid(zone, grid_cells)
         save_cells_geojson(cells, Path("static") / "sectors.geojson", grid_cells)
-        map_segments_to_cells(segments, cells)
     except Exception as exc:  # noqa: BLE001
-        print_stage(Fore.RED + f"Ошибка подготовки данных: {exc}" + Style.RESET_ALL)
+        print_stage(Fore.RED + f"Ошибка подготовки сетки: {exc}" + Style.RESET_ALL)
         raise
 
     if args.generate_grid:
         print_stage("Генерация сетки завершена")
         return
+
+    try:
+        segments = parse_roads(args.roads, zone)
+        map_segments_to_cells(segments, cells)
+    except Exception as exc:  # noqa: BLE001
+        print_stage(Fore.RED + f"Ошибка подготовки дорог: {exc}" + Style.RESET_ALL)
+        raise
 
     try:
         assignments = load_assignments(args.assignments)

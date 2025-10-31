@@ -42,6 +42,7 @@ _initialized = False
 _dotenv_path = APP_ROOT / ".env"
 _settings_lock = threading.Lock()
 _grid_cells = GRID_CELLS
+_grid_error: Optional[str] = None
 
 
 def refresh_env() -> None:
@@ -119,7 +120,8 @@ def ensure_grid_exists(force: bool = False, grid_cells: Optional[int] = None) ->
         subprocess.run(args, check=True)
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         app.logger.warning(
-            "Не удалось сгенерировать сетку автоматически. Проверьте входные файлы."
+            "Не удалось сгенерировать сетку автоматически. Проверьте входные файлы.",
+            exc_info=exc,
         )
         raise RuntimeError("Ошибка генерации сетки") from exc
     if not SECTORS_GEOJSON.exists():
@@ -127,7 +129,7 @@ def ensure_grid_exists(force: bool = False, grid_cells: Optional[int] = None) ->
 
 
 def initialize_state() -> None:
-    global _current_assignments, _initialized, _grid_cells
+    global _current_assignments, _initialized, _grid_cells, _grid_error
     if _initialized:
         return
     refresh_env()
@@ -135,7 +137,12 @@ def initialize_state() -> None:
         _grid_cells = load_grid_settings()
         if not GRID_SETTINGS_PATH.exists():
             save_grid_settings(_grid_cells)
-    ensure_grid_exists(grid_cells=_grid_cells)
+    try:
+        ensure_grid_exists(grid_cells=_grid_cells)
+        _grid_error = None
+    except Exception as exc:  # noqa: BLE001
+        _grid_error = str(exc)
+        app.logger.error("Инициализация сетки завершилась ошибкой", exc_info=exc)
     with _assignments_lock:
         _current_assignments = load_assignments()
     _initialized = True
@@ -164,6 +171,7 @@ def index() -> str:
         google_key_present=bool(os.getenv("GOOGLE_API_KEY")),
         dotenv_path=str(_dotenv_path),
         dotenv_exists=_dotenv_path.exists(),
+        grid_error=_grid_error,
     )
 
 
@@ -207,9 +215,11 @@ def run_builder() -> Response:
 
 
 def _background_build() -> None:
+    global _grid_error
     try:
         refresh_env()
         ensure_grid_exists(grid_cells=_grid_cells)
+        _grid_error = None
         args = [
             os.sys.executable,
             str(APP_ROOT / "route_builder_grid_v7_1.py"),
@@ -247,6 +257,7 @@ def _background_build() -> None:
             socketio.emit("progress", {"message": f"Ошибка построения (код {returncode})"})
             socketio.emit("build_done", {"success": False})
     except Exception as exc:  # noqa: BLE001
+        _grid_error = str(exc)
         socketio.emit("progress", {"message": f"Исключение: {exc}"})
         socketio.emit("build_done", {"success": False})
     finally:
@@ -291,6 +302,7 @@ def reset_assignments():
 
 @app.post("/grid")
 def update_grid() -> Response:
+    global _grid_error
     initialize_state()
     if _build_lock.locked():
         return jsonify({"error": "Нельзя менять сетку во время построения маршрутов"}), 409
@@ -315,10 +327,12 @@ def update_grid() -> Response:
 
     try:
         ensure_grid_exists(force=True, grid_cells=_grid_cells)
+        _grid_error = None
     except Exception as exc:  # noqa: BLE001
         with _settings_lock:
             _grid_cells = current
             save_grid_settings(_grid_cells)
+        _grid_error = str(exc)
         return jsonify({"error": f"Не удалось сформировать сетку: {exc}"}), 500
 
     with _assignments_lock:

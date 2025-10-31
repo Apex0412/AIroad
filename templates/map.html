@@ -156,7 +156,7 @@
       }
     </style>
   </head>
-  <body data-initial-grid-cells="{{ grid_cells }}">
+  <body data-initial-grid-cells="{{ grid_cells }}" data-grid-error="{{ grid_error or '' }}">
     <div id="layout">
       <aside id="sidebar">
         <h1>Диспетчеризация тракторов</h1>
@@ -190,6 +190,11 @@
         {% if not google_key_present %}
         <p style="background:#ffecb3; padding:10px; border-radius:6px; font-size:13px;">
           <strong>Внимание:</strong> Google API ключ не найден. Переезды будут прямыми линиями.
+        </p>
+        {% endif %}
+        {% if grid_error %}
+        <p style="background:#ffccbc; padding:10px; border-radius:6px; font-size:13px;">
+          <strong>Ошибка сетки:</strong> {{ grid_error }}. Проверьте наличие файлов GEO.kml и RoadCity.kml и повторите попытку через выпадающее меню «Размер сетки».
         </p>
         {% endif %}
         <div class="control-group">
@@ -260,6 +265,7 @@
       });
 
       const socket = io();
+      const initialGridError = (document.body.dataset.gridError || "").trim();
       const initialGridCells = Number(document.body.dataset.initialGridCells || 0);
       let currentGridCells = Number.isFinite(initialGridCells) && initialGridCells > 0 ? initialGridCells : 0;
       let geoLayer = null;
@@ -341,6 +347,11 @@
               map.fitBounds(bounds, { padding: [40, 40] });
             }
             setTimeout(() => map.invalidateSize(), 100);
+            if (!geojson?.features?.length) {
+              appendLog(
+                "Сетка не содержит полигонов. Убедитесь, что файлы GEO.kml и RoadCity.kml размещены рядом с server.py и перегенерируйте сетку."
+              );
+            }
           })
           .catch((error) => {
             appendLog(`Ошибка загрузки GeoJSON: ${error.message || error}`);
@@ -455,6 +466,9 @@
         loadGeojson(true);
       });
 
+      if (initialGridError) {
+        appendLog(`Ошибка подготовки сетки: ${initialGridError}`);
+      }
       loadGeojson(true);
       setTimeout(() => map.invalidateSize(), 150);
       window.addEventListener("resize", () => map.invalidateSize());
