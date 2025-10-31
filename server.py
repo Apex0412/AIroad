@@ -33,6 +33,7 @@ _assignments_lock = threading.Lock()
 _current_assignments: Dict[str, str] = {}
 _build_lock = threading.Lock()
 _ansi_regex = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+_initialized = False
 
 
 def load_assignments() -> Dict[str, str]:
@@ -63,18 +64,24 @@ def ensure_grid_exists() -> None:
     try:
         subprocess.run(args, check=True)
     except (subprocess.CalledProcessError, FileNotFoundError):
-        app.logger.warning("Не удалось сгенерировать сетку автоматически. Проверьте входные файлы.")
+        app.logger.warning(
+            "Не удалось сгенерировать сетку автоматически. Проверьте входные файлы."
+        )
 
 
-@app.before_first_request
-def startup() -> None:
-    global _current_assignments
+def initialize_state() -> None:
+    global _current_assignments, _initialized
+    if _initialized:
+        return
     ensure_grid_exists()
-    _current_assignments = load_assignments()
+    with _assignments_lock:
+        _current_assignments = load_assignments()
+    _initialized = True
 
 
 @app.route("/")
 def index() -> str:
+    initialize_state()
     tractors = [
         {
             "id": f"tractor_{i+1:02d}",
@@ -110,6 +117,7 @@ def download() -> Response:
 
 @app.post("/run")
 def run_builder() -> Response:
+    initialize_state()
     if not GEO_PATH.exists() or not ROADS_PATH.exists():
         return jsonify({"error": "Файлы GEO.kml и RoadCity.kml должны находиться в корне проекта"}), 400
 
@@ -176,6 +184,7 @@ def _background_build() -> None:
 
 @socketio.on("connect")
 def handle_connect():
+    initialize_state()
     emit("assignments", _current_assignments)
 
 
@@ -201,6 +210,7 @@ def assign_sector(payload):
 
 @socketio.on("assignments_reset")
 def reset_assignments():
+    initialize_state()
     with _assignments_lock:
         _current_assignments.clear()
         save_assignments(_current_assignments)
@@ -208,6 +218,7 @@ def reset_assignments():
 
 
 def main() -> None:
+    initialize_state()
     socketio.run(app, host="0.0.0.0", port=5000)
 
 
