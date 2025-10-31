@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <title>Диспетчеризация уборочной техники</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha512-Rksm4b58ksH9dMRSf+T0Kp1xE7O9Kf6NWJzi10BGSAdoo6gWgfO2TUMpKyDJZH/5LiCFYl8a9kaGb0OQGa8mEA=="
+      crossorigin=""
+    />
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha512-DomP3l7YfJZHF4RSbVSSMzdON3NofM8JrIoVNewc19hXtOD87bwo4V/mQJu1jLKYj1WFJsbgx5caX5/C7N44hA=="
+      crossorigin=""
+    ></script>
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+    <style>
+      body {
+        margin: 0;
+        font-family: "Segoe UI", Roboto, sans-serif;
+        color: #263238;
+        background: #f5f7fa;
+      }
+
+      #layout {
+        display: grid;
+        grid-template-columns: 320px 1fr;
+        height: 100vh;
+      }
+
+      #sidebar {
+        padding: 20px;
+        background: #ffffff;
+        border-right: 1px solid #e0e0e0;
+        overflow-y: auto;
+      }
+
+      #map {
+        width: 100%;
+        height: 100%;
+      }
+
+      h1 {
+        font-size: 20px;
+        margin-top: 0;
+      }
+
+      select,
+      button {
+        width: 100%;
+        padding: 10px;
+        margin-top: 10px;
+        border: 1px solid #b0bec5;
+        border-radius: 6px;
+        font-size: 15px;
+        cursor: pointer;
+        transition: background 0.2s ease;
+      }
+
+      button.primary {
+        background: #1976d2;
+        color: white;
+        border: none;
+      }
+
+      button.primary:disabled {
+        background: #90a4ae;
+        cursor: default;
+      }
+
+      button.secondary {
+        background: #eceff1;
+        color: #37474f;
+      }
+
+      button.secondary:hover {
+        background: #e0e0e0;
+      }
+
+      .legend {
+        margin-top: 20px;
+        border-top: 1px solid #eceff1;
+        padding-top: 10px;
+      }
+
+      .legend-item {
+        display: flex;
+        align-items: center;
+        margin-bottom: 4px;
+        font-size: 14px;
+      }
+
+      .legend-color {
+        width: 16px;
+        height: 16px;
+        border-radius: 3px;
+        margin-right: 8px;
+        border: 1px solid rgba(0, 0, 0, 0.2);
+      }
+
+      #log {
+        margin-top: 20px;
+        padding: 12px;
+        background: #fafafa;
+        border-radius: 6px;
+        border: 1px solid #eceff1;
+        height: 200px;
+        overflow-y: auto;
+        font-size: 13px;
+        line-height: 1.4;
+        white-space: pre-line;
+      }
+
+      .status {
+        margin-top: 12px;
+        font-size: 13px;
+        color: #546e7a;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="layout">
+      <aside id="sidebar">
+        <h1>Диспетчеризация тракторов</h1>
+        <p style="font-size: 14px; color: #607d8b; margin-bottom: 8px;">
+          Цель: около {{ target_km|round(1) }} км на трактор. Всего тракторов: {{ tractors|length }}.
+        </p>
+        {% if not google_key_present %}
+        <p style="background:#ffecb3; padding:10px; border-radius:6px; font-size:13px;">
+          <strong>Внимание:</strong> Google API ключ не найден. Переезды будут прямыми линиями.
+        </p>
+        {% endif %}
+        <label for="tractor-select" style="font-size: 13px; font-weight: 600;">Выберите трактор</label>
+        <select id="tractor-select">
+          {% for tractor in tractors %}
+          <option value="{{ tractor.id }}" data-color="{{ tractor.color }}">{{ tractor.name }}</option>
+          {% endfor %}
+        </select>
+        <button id="clear-tractor" class="secondary">Очистить выделение для трактора</button>
+        <button id="reset-all" class="secondary">Сбросить всё</button>
+        <button id="build" class="primary">💾 Сохранить и построить</button>
+        <button id="download" class="secondary" disabled>⬇️ Скачать KML</button>
+
+        <div class="legend">
+          <h2 style="font-size: 15px; margin-bottom: 6px;">Легенда</h2>
+          {% for tractor in tractors %}
+          <div class="legend-item">
+            <span class="legend-color" style="background: {{ tractor.color }}"></span>
+            <span>{{ tractor.name }}</span>
+          </div>
+          {% endfor %}
+        </div>
+
+        <div class="status">
+          <div>Клеток в сетке: {{ grid_cells }}</div>
+          <div>Карта центрирована в точке {{ center_lat }}, {{ center_lon }}</div>
+        </div>
+
+        <div id="log"></div>
+      </aside>
+      <div id="map"></div>
+    </div>
+
+    <script>
+      const map = L.map("map").setView([{{ center_lat }}, {{ center_lon }}], 12.5);
+
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 18,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/">OpenStreetMap</a> contributors',
+      }).addTo(map);
+
+      const assignments = {};
+      const sectorLayers = new Map();
+      const tractorSelect = document.getElementById("tractor-select");
+      const logEl = document.getElementById("log");
+      const downloadBtn = document.getElementById("download");
+      const buildBtn = document.getElementById("build");
+      const clearBtn = document.getElementById("clear-tractor");
+      const resetBtn = document.getElementById("reset-all");
+      const tractorColors = {};
+      Array.from(tractorSelect.options).forEach((option) => {
+        tractorColors[option.value] = option.dataset.color;
+      });
+
+      const socket = io();
+
+      socket.on("assignments", (data) => {
+        Object.keys(assignments).forEach((key) => delete assignments[key]);
+        Object.assign(assignments, data || {});
+        recolorAll();
+      });
+
+      socket.on("assign_sector", ({ sector_id, tractor_id }) => {
+        if (!sector_id) return;
+        if (tractor_id) {
+          assignments[sector_id] = tractor_id;
+        } else {
+          delete assignments[sector_id];
+        }
+        recolorSector(sector_id);
+      });
+
+      socket.on("progress", ({ message }) => {
+        appendLog(message);
+      });
+
+      socket.on("build_done", ({ success }) => {
+        buildBtn.disabled = false;
+        if (success) {
+          downloadBtn.disabled = false;
+          downloadBtn.classList.remove("secondary");
+          downloadBtn.classList.add("primary");
+        } else {
+          downloadBtn.disabled = true;
+          downloadBtn.classList.remove("primary");
+          downloadBtn.classList.add("secondary");
+        }
+      });
+
+      fetch("/geo")
+        .then((resp) => resp.json())
+        .then((geojson) => {
+          const layer = L.geoJSON(geojson, {
+            style: (feature) => ({
+              color: "#b0bec5",
+              weight: 1,
+              fillOpacity: 0.2,
+              fillColor: "#eceff1",
+            }),
+            onEachFeature: (feature, layer) => {
+              const sectorId = feature?.properties?.id;
+              if (!sectorId) return;
+              sectorLayers.set(sectorId, layer);
+              layer.on("click", () => {
+                const tractorId = tractorSelect.value;
+                assignments[sectorId] = tractorId;
+                recolorSector(sectorId);
+                socket.emit("assign_sector", { sector_id: sectorId, tractor_id: tractorId });
+              });
+              recolorSector(sectorId);
+            },
+          });
+          layer.addTo(map);
+          const bounds = layer.getBounds();
+          if (bounds.isValid()) {
+            map.fitBounds(bounds, { padding: [40, 40] });
+          }
+        })
+        .catch((error) => {
+          appendLog(`Ошибка загрузки GeoJSON: ${error}`);
+        });
+
+      clearBtn.addEventListener("click", () => {
+        const tractorId = tractorSelect.value;
+        Object.entries(assignments).forEach(([sectorId, assignedTo]) => {
+          if (assignedTo === tractorId) {
+            delete assignments[sectorId];
+            recolorSector(sectorId);
+            socket.emit("assign_sector", { sector_id: sectorId, tractor_id: null });
+          }
+        });
+      });
+
+      resetBtn.addEventListener("click", () => {
+        Object.keys(assignments).forEach((key) => delete assignments[key]);
+        recolorAll();
+        socket.emit("assignments_reset", {});
+      });
+
+      buildBtn.addEventListener("click", () => {
+        buildBtn.disabled = true;
+        downloadBtn.disabled = true;
+        downloadBtn.classList.remove("primary");
+        downloadBtn.classList.add("secondary");
+        appendLog("Запускаю построение маршрутов...");
+        fetch("/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ assignments }),
+        })
+          .then((resp) => resp.json().then((data) => ({ ok: resp.ok, data })))
+          .then(({ ok, data }) => {
+            if (!ok) {
+              throw new Error(data?.error || "Не удалось запустить построение");
+            }
+            appendLog("Маршрутизация запущена");
+          })
+          .catch((error) => {
+            appendLog(`Ошибка запуска: ${error.message}`);
+            buildBtn.disabled = false;
+          });
+      });
+
+      downloadBtn.addEventListener("click", () => {
+        window.location.href = "/download";
+      });
+
+      function recolorSector(sectorId) {
+        const layer = sectorLayers.get(sectorId);
+        if (!layer) return;
+        const tractorId = assignments[sectorId];
+        if (!tractorId) {
+          layer.setStyle({ fillColor: "#eceff1", fillOpacity: 0.15 });
+          layer.bindTooltip(`${sectorId}: не назначено`, { sticky: true });
+          return;
+        }
+        const option = tractorSelect.querySelector(`option[value="${tractorId}"]`);
+        const color = tractorColors[tractorId] || "#90a4ae";
+        layer.setStyle({ fillColor: color, fillOpacity: 0.45 });
+        layer.bindTooltip(`${sectorId}: ${option?.textContent || tractorId}`, { sticky: true });
+      }
+
+      function recolorAll() {
+        sectorLayers.forEach((_layer, sectorId) => recolorSector(sectorId));
+      }
+
+      function appendLog(message) {
+        const time = new Date().toLocaleTimeString();
+        const prefix = logEl.textContent.trim() ? "\n" : "";
+        logEl.textContent += `${prefix}[${time}] ${message}`;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+    </script>
+  </body>
+</html>
