@@ -155,6 +155,14 @@
             Быстрый старт: <code>cp .env.example .env</code>, затем отредактируйте
             файл и вставьте ключ.
           </p>
+          <p style="margin: 6px 0 0;">
+            Текущий путь: <code>{{ dotenv_path }}</code>
+            {% if dotenv_exists %}
+            — файл найден.
+            {% else %}
+            — файл не найден.
+            {% endif %}
+          </p>
           {% if google_key_present %}
           <p style="margin: 6px 0 0; color: #1b5e20; font-weight: 600;">Ключ обнаружен на сервере.</p>
           {% else %}

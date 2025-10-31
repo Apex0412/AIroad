@@ -29,7 +29,7 @@ import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-load_dotenv(PROJECT_ROOT / ".env")
+load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 # ---------------------------------------------------------------------------
 # Configuration parameters – tweak here to adjust behaviour globally.

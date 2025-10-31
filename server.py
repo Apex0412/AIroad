@@ -20,6 +20,7 @@ from route_builder_grid_v7_1 import (
 )
 
 APP_ROOT = Path(__file__).parent.resolve()
+# Re-load the .env file now so an already-configured key is visible on startup.
 load_dotenv(APP_ROOT / ".env")
 GEO_PATH = APP_ROOT / "GEO.kml"
 ROADS_PATH = APP_ROOT / "RoadCity.kml"
@@ -36,6 +37,16 @@ _current_assignments: Dict[str, str] = {}
 _build_lock = threading.Lock()
 _ansi_regex = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 _initialized = False
+_dotenv_path = APP_ROOT / ".env"
+
+
+def refresh_env() -> None:
+    """Ensure the latest values from the .env file are available."""
+
+    # override=True allows late edits without restarting the container the
+    # application runs in. We only override keys declared in the .env file.
+    if _dotenv_path.exists():
+        load_dotenv(_dotenv_path, override=True)
 
 
 def load_assignments() -> Dict[str, str]:
@@ -75,6 +86,7 @@ def initialize_state() -> None:
     global _current_assignments, _initialized
     if _initialized:
         return
+    refresh_env()
     ensure_grid_exists()
     with _assignments_lock:
         _current_assignments = load_assignments()
@@ -84,6 +96,7 @@ def initialize_state() -> None:
 @app.route("/")
 def index() -> str:
     initialize_state()
+    refresh_env()
     tractors = [
         {
             "id": f"tractor_{i+1:02d}",
@@ -100,6 +113,8 @@ def index() -> str:
         target_km=TARGET_M / 1000,
         grid_cells=GRID_CELLS,
         google_key_present=bool(os.getenv("GOOGLE_API_KEY")),
+        dotenv_path=str(_dotenv_path),
+        dotenv_exists=_dotenv_path.exists(),
     )
 
 
@@ -120,6 +135,7 @@ def download() -> Response:
 @app.post("/run")
 def run_builder() -> Response:
     initialize_state()
+    refresh_env()
     if not GEO_PATH.exists() or not ROADS_PATH.exists():
         return jsonify({"error": "Файлы GEO.kml и RoadCity.kml должны находиться в корне проекта"}), 400
 
@@ -143,6 +159,7 @@ def run_builder() -> Response:
 
 def _background_build() -> None:
     try:
+        refresh_env()
         args = [
             os.sys.executable,
             str(APP_ROOT / "route_builder_grid_v7_1.py"),
