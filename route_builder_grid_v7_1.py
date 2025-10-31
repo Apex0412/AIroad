@@ -37,6 +37,7 @@ load_dotenv(PROJECT_ROOT / ".env", override=True)
 N_UNITS: int = 18
 TARGET_M: float = 30_000.0
 GRID_CELLS: int = 64
+GRID_CELL_OPTIONS: List[int] = [64, 100, 144, 196]
 GOOGLE_API_KEY: Optional[str] = os.getenv("GOOGLE_API_KEY")
 TRAVEL_MODE: str = "driving"
 MAX_WAYPOINTS: int = 23
@@ -282,7 +283,7 @@ def _ensure_polygon(geometry) -> Polygon:
     raise ValueError("Ожидался Polygon/MultiPolygon при построении сетки")
 
 
-def save_cells_geojson(cells: Sequence[Cell], out_path: Path) -> None:
+def save_cells_geojson(cells: Sequence[Cell], out_path: Path, grid_cells: int) -> None:
     print_stage("[4/8] Экспортирую сетку в GeoJSON")
     features = []
     for cell in cells:
@@ -301,7 +302,14 @@ def save_cells_geojson(cells: Sequence[Cell], out_path: Path) -> None:
         }
         features.append(feature)
 
-    geojson = {"type": "FeatureCollection", "features": features}
+    geojson = {
+        "type": "FeatureCollection",
+        "features": features,
+        "metadata": {
+            "grid_cells": grid_cells,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+    }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(geojson, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -619,6 +627,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Только сформировать GeoJSON сетки и завершиться",
     )
+    parser.add_argument(
+        "--grid-cells",
+        type=int,
+        default=GRID_CELLS,
+        help="Количество ячеек сетки (по умолчанию соответствует конфигурации)",
+    )
     return parser.parse_args(argv)
 
 
@@ -635,8 +649,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     try:
         zone = parse_geo_boundary(args.geo)
         segments = parse_roads(args.roads, zone)
-        cells = build_grid(zone, GRID_CELLS)
-        save_cells_geojson(cells, Path("static") / "sectors.geojson")
+        grid_cells = max(1, args.grid_cells or GRID_CELLS)
+        cells = build_grid(zone, grid_cells)
+        save_cells_geojson(cells, Path("static") / "sectors.geojson", grid_cells)
         map_segments_to_cells(segments, cells)
     except Exception as exc:  # noqa: BLE001
         print_stage(Fore.RED + f"Ошибка подготовки данных: {exc}" + Style.RESET_ALL)

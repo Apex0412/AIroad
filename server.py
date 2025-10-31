@@ -4,7 +4,7 @@ import re
 import subprocess
 import threading
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from flask_socketio import SocketIO, emit
@@ -14,6 +14,7 @@ from route_builder_grid_v7_1 import (
     CENTER_LAT,
     CENTER_LON,
     GRID_CELLS,
+    GRID_CELL_OPTIONS,
     N_UNITS,
     TARGET_M,
     TRACTOR_COLORS,
@@ -27,6 +28,7 @@ ROADS_PATH = APP_ROOT / "RoadCity.kml"
 ASSIGNMENTS_PATH = APP_ROOT / "assignments.json"
 SECTORS_GEOJSON = APP_ROOT / "static" / "sectors.geojson"
 ROUTES_KML = APP_ROOT / "routes_grid.kml"
+GRID_SETTINGS_PATH = APP_ROOT / "grid_settings.json"
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET", "tractor-secret")
@@ -38,6 +40,8 @@ _build_lock = threading.Lock()
 _ansi_regex = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 _initialized = False
 _dotenv_path = APP_ROOT / ".env"
+_settings_lock = threading.Lock()
+_grid_cells = GRID_CELLS
 
 
 def refresh_env() -> None:
@@ -62,9 +66,41 @@ def save_assignments(assignments: Dict[str, str]) -> None:
     ASSIGNMENTS_PATH.write_text(json.dumps(assignments, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def ensure_grid_exists() -> None:
-    if SECTORS_GEOJSON.exists():
-        return
+def load_grid_settings() -> int:
+    if GRID_SETTINGS_PATH.exists():
+        try:
+            data = json.loads(GRID_SETTINGS_PATH.read_text(encoding="utf-8"))
+            value = int(data.get("grid_cells", GRID_CELLS))
+            if value <= 0:
+                raise ValueError
+            return value
+        except (ValueError, json.JSONDecodeError):
+            app.logger.warning("Некорректный grid_settings.json – используется значение по умолчанию")
+    return GRID_CELLS
+
+
+def save_grid_settings(grid_cells: int) -> None:
+    GRID_SETTINGS_PATH.write_text(json.dumps({"grid_cells": grid_cells}, indent=2), encoding="utf-8")
+
+
+def read_geojson_grid_cells() -> Optional[int]:
+    if not SECTORS_GEOJSON.exists():
+        return None
+    try:
+        data = json.loads(SECTORS_GEOJSON.read_text(encoding="utf-8"))
+        meta = data.get("metadata", {})
+        value = int(meta.get("grid_cells"))
+        return value if value > 0 else None
+    except (ValueError, json.JSONDecodeError, OSError, AttributeError):
+        return None
+
+
+def ensure_grid_exists(force: bool = False, grid_cells: Optional[int] = None) -> None:
+    desired_cells = grid_cells or _grid_cells or GRID_CELLS
+    if not force:
+        existing = read_geojson_grid_cells()
+        if existing == desired_cells and SECTORS_GEOJSON.exists():
+            return
     args = [
         os.sys.executable,
         str(APP_ROOT / "route_builder_grid_v7_1.py"),
@@ -74,20 +110,29 @@ def ensure_grid_exists() -> None:
         str(ROADS_PATH),
         "--generate-grid",
     ]
+    if desired_cells:
+        args.extend(["--grid-cells", str(desired_cells)])
     try:
         subprocess.run(args, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         app.logger.warning(
             "Не удалось сгенерировать сетку автоматически. Проверьте входные файлы."
         )
+        raise RuntimeError("Ошибка генерации сетки") from exc
+    if not SECTORS_GEOJSON.exists():
+        raise RuntimeError("Файл sectors.geojson не создан")
 
 
 def initialize_state() -> None:
-    global _current_assignments, _initialized
+    global _current_assignments, _initialized, _grid_cells
     if _initialized:
         return
     refresh_env()
-    ensure_grid_exists()
+    with _settings_lock:
+        _grid_cells = load_grid_settings()
+        if not GRID_SETTINGS_PATH.exists():
+            save_grid_settings(_grid_cells)
+    ensure_grid_exists(grid_cells=_grid_cells)
     with _assignments_lock:
         _current_assignments = load_assignments()
     _initialized = True
@@ -111,7 +156,8 @@ def index() -> str:
         center_lat=CENTER_LAT,
         center_lon=CENTER_LON,
         target_km=TARGET_M / 1000,
-        grid_cells=GRID_CELLS,
+        grid_cells=_grid_cells,
+        grid_options=GRID_CELL_OPTIONS,
         google_key_present=bool(os.getenv("GOOGLE_API_KEY")),
         dotenv_path=str(_dotenv_path),
         dotenv_exists=_dotenv_path.exists(),
@@ -160,6 +206,7 @@ def run_builder() -> Response:
 def _background_build() -> None:
     try:
         refresh_env()
+        ensure_grid_exists(grid_cells=_grid_cells)
         args = [
             os.sys.executable,
             str(APP_ROOT / "route_builder_grid_v7_1.py"),
@@ -171,6 +218,8 @@ def _background_build() -> None:
             str(ASSIGNMENTS_PATH),
             "--output",
             str(ROUTES_KML),
+            "--grid-cells",
+            str(_grid_cells),
         ]
         process = subprocess.Popen(
             args,
@@ -205,6 +254,7 @@ def _background_build() -> None:
 def handle_connect():
     initialize_state()
     emit("assignments", _current_assignments)
+    emit("grid_settings", {"grid_cells": _grid_cells})
 
 
 @socketio.on("assign_sector")
@@ -234,6 +284,49 @@ def reset_assignments():
         _current_assignments.clear()
         save_assignments(_current_assignments)
     emit("assignments", _current_assignments, broadcast=True)
+
+
+@app.post("/grid")
+def update_grid() -> Response:
+    initialize_state()
+    if _build_lock.locked():
+        return jsonify({"error": "Нельзя менять сетку во время построения маршрутов"}), 409
+    data = request.get_json(force=True, silent=True) or {}
+    raw_value = data.get("grid_cells")
+    try:
+        new_value = int(raw_value)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Неверное значение grid_cells"}), 400
+    if new_value <= 0:
+        return jsonify({"error": "Количество клеток должно быть положительным"}), 400
+
+    global _grid_cells
+    with _settings_lock:
+        current = _grid_cells
+        if new_value == current and not data.get("force"):
+            emit_payload = {"grid_cells": current}
+            socketio.emit("grid_settings", emit_payload, broadcast=True)
+            return jsonify({"status": "unchanged", "grid_cells": current})
+        _grid_cells = new_value
+        save_grid_settings(_grid_cells)
+
+    try:
+        ensure_grid_exists(force=True, grid_cells=_grid_cells)
+    except Exception as exc:  # noqa: BLE001
+        with _settings_lock:
+            _grid_cells = current
+            save_grid_settings(_grid_cells)
+        return jsonify({"error": f"Не удалось сформировать сетку: {exc}"}), 500
+
+    with _assignments_lock:
+        _current_assignments.clear()
+        save_assignments(_current_assignments)
+
+    payload = {"grid_cells": _grid_cells}
+    socketio.emit("grid_settings", payload, broadcast=True)
+    socketio.emit("assignments", _current_assignments, broadcast=True)
+
+    return jsonify({"status": "ok", "grid_cells": _grid_cells})
 
 
 def main() -> None:

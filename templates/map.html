@@ -17,6 +17,11 @@
     ></script>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
     <style>
+      html,
+      body {
+        height: 100%;
+      }
+
       body {
         margin: 0;
         font-family: "Segoe UI", Roboto, sans-serif;
@@ -28,6 +33,7 @@
         display: grid;
         grid-template-columns: 320px 1fr;
         height: 100vh;
+        width: 100vw;
       }
 
       #sidebar {
@@ -40,6 +46,8 @@
       #map {
         width: 100%;
         height: 100%;
+        min-height: 100vh;
+        background: #ddeaf6;
       }
 
       h1 {
@@ -77,6 +85,16 @@
 
       button.secondary:hover {
         background: #e0e0e0;
+      }
+
+      .control-group {
+        margin-top: 14px;
+      }
+
+      .hint {
+        margin: 6px 0 0;
+        font-size: 12px;
+        color: #607d8b;
       }
 
       .info-box {
@@ -138,7 +156,7 @@
       }
     </style>
   </head>
-  <body>
+  <body data-initial-grid-cells="{{ grid_cells }}">
     <div id="layout">
       <aside id="sidebar">
         <h1>Диспетчеризация тракторов</h1>
@@ -174,6 +192,19 @@
           <strong>Внимание:</strong> Google API ключ не найден. Переезды будут прямыми линиями.
         </p>
         {% endif %}
+        <div class="control-group">
+          <label for="grid-select" style="font-size: 13px; font-weight: 600;">Размер сетки</label>
+          <select id="grid-select">
+            {% if grid_cells not in grid_options %}
+            <option value="{{ grid_cells }}" selected>{{ grid_cells }} клеток</option>
+            {% endif %}
+            {% for option in grid_options %}
+            <option value="{{ option }}" {% if option == grid_cells %}selected{% endif %}>{{ option }} клеток</option>
+            {% endfor %}
+          </select>
+          <p class="hint">При смене сетки текущие назначения будут сброшены.</p>
+        </div>
+
         <label for="tractor-select" style="font-size: 13px; font-weight: 600;">Выберите трактор</label>
         <select id="tractor-select">
           {% for tractor in tractors %}
@@ -196,7 +227,7 @@
         </div>
 
         <div class="status">
-          <div>Клеток в сетке: {{ grid_cells }}</div>
+          <div>Клеток в сетке: <span id="grid-count">{{ grid_cells }}</span></div>
           <div>Карта центрирована в точке {{ center_lat }}, {{ center_lon }}</div>
         </div>
 
@@ -216,6 +247,8 @@
       const assignments = {};
       const sectorLayers = new Map();
       const tractorSelect = document.getElementById("tractor-select");
+      const gridSelect = document.getElementById("grid-select");
+      const gridCountLabel = document.getElementById("grid-count");
       const logEl = document.getElementById("log");
       const downloadBtn = document.getElementById("download");
       const buildBtn = document.getElementById("build");
@@ -227,6 +260,10 @@
       });
 
       const socket = io();
+      const initialGridCells = Number(document.body.dataset.initialGridCells || 0);
+      let currentGridCells = Number.isFinite(initialGridCells) && initialGridCells > 0 ? initialGridCells : 0;
+      let geoLayer = null;
+      let pendingGridSelection = null;
 
       socket.on("assignments", (data) => {
         Object.keys(assignments).forEach((key) => delete assignments[key]);
@@ -261,38 +298,54 @@
         }
       });
 
-      fetch("/geo")
-        .then((resp) => resp.json())
-        .then((geojson) => {
-          const layer = L.geoJSON(geojson, {
-            style: (feature) => ({
-              color: "#b0bec5",
-              weight: 1,
-              fillOpacity: 0.2,
-              fillColor: "#eceff1",
-            }),
-            onEachFeature: (feature, layer) => {
-              const sectorId = feature?.properties?.id;
-              if (!sectorId) return;
-              sectorLayers.set(sectorId, layer);
-              layer.on("click", () => {
-                const tractorId = tractorSelect.value;
-                assignments[sectorId] = tractorId;
+      function loadGeojson(showLog = false) {
+        if (showLog) {
+          appendLog(`Загружаю сетку (${currentGridCells || "?"} клеток)...`);
+        }
+        if (geoLayer) {
+          map.removeLayer(geoLayer);
+          geoLayer = null;
+        }
+        sectorLayers.clear();
+        fetch("/geo")
+          .then((resp) => {
+            if (!resp.ok) {
+              throw new Error(`HTTP ${resp.status}`);
+            }
+            return resp.json();
+          })
+          .then((geojson) => {
+            geoLayer = L.geoJSON(geojson, {
+              style: (feature) => ({
+                color: "#b0bec5",
+                weight: 1,
+                fillOpacity: 0.2,
+                fillColor: "#eceff1",
+              }),
+              onEachFeature: (feature, layer) => {
+                const sectorId = feature?.properties?.id;
+                if (!sectorId) return;
+                sectorLayers.set(sectorId, layer);
+                layer.on("click", () => {
+                  const tractorId = tractorSelect.value;
+                  assignments[sectorId] = tractorId;
+                  recolorSector(sectorId);
+                  socket.emit("assign_sector", { sector_id: sectorId, tractor_id: tractorId });
+                });
                 recolorSector(sectorId);
-                socket.emit("assign_sector", { sector_id: sectorId, tractor_id: tractorId });
-              });
-              recolorSector(sectorId);
-            },
+              },
+            });
+            geoLayer.addTo(map);
+            const bounds = geoLayer.getBounds();
+            if (bounds.isValid()) {
+              map.fitBounds(bounds, { padding: [40, 40] });
+            }
+            setTimeout(() => map.invalidateSize(), 100);
+          })
+          .catch((error) => {
+            appendLog(`Ошибка загрузки GeoJSON: ${error.message || error}`);
           });
-          layer.addTo(map);
-          const bounds = layer.getBounds();
-          if (bounds.isValid()) {
-            map.fitBounds(bounds, { padding: [40, 40] });
-          }
-        })
-        .catch((error) => {
-          appendLog(`Ошибка загрузки GeoJSON: ${error}`);
-        });
+      }
 
       clearBtn.addEventListener("click", () => {
         const tractorId = tractorSelect.value;
@@ -310,6 +363,50 @@
         recolorAll();
         socket.emit("assignments_reset", {});
       });
+
+      if (gridSelect) {
+        gridSelect.addEventListener("change", () => {
+          const selected = Number(gridSelect.value);
+          if (!Number.isFinite(selected) || selected <= 0 || selected === currentGridCells) {
+            return;
+          }
+          pendingGridSelection = selected;
+          gridSelect.disabled = true;
+          appendLog(`Запрашиваю сетку на ${selected} клеток...`);
+          fetch("/grid", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ grid_cells: selected }),
+          })
+            .then((resp) => resp.json().then((data) => ({ ok: resp.ok, data })))
+            .then(({ ok, data }) => {
+              if (!ok) {
+                throw new Error(data?.error || "Не удалось обновить сетку");
+              }
+              const updated = Number(data?.grid_cells);
+              if (Number.isFinite(updated)) {
+                currentGridCells = updated;
+                if (gridCountLabel) {
+                  gridCountLabel.textContent = updated;
+                }
+              }
+              downloadBtn.disabled = true;
+              downloadBtn.classList.remove("primary");
+              downloadBtn.classList.add("secondary");
+              appendLog("Сетка будет перезагружена – назначения очищены.");
+            })
+            .catch((error) => {
+              appendLog(`Ошибка обновления сетки: ${error.message}`);
+              if (pendingGridSelection !== null && Number.isFinite(currentGridCells)) {
+                gridSelect.value = String(currentGridCells);
+              }
+              pendingGridSelection = null;
+            })
+            .finally(() => {
+              gridSelect.disabled = false;
+            });
+        });
+      }
 
       buildBtn.addEventListener("click", () => {
         buildBtn.disabled = true;
@@ -338,6 +435,29 @@
       downloadBtn.addEventListener("click", () => {
         window.location.href = "/download";
       });
+
+      socket.on("grid_settings", ({ grid_cells: value }) => {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          return;
+        }
+        currentGridCells = parsed;
+        pendingGridSelection = null;
+        if (gridSelect && Number(gridSelect.value) !== parsed) {
+          gridSelect.value = String(parsed);
+        }
+        if (gridCountLabel) {
+          gridCountLabel.textContent = parsed;
+        }
+        downloadBtn.disabled = true;
+        downloadBtn.classList.remove("primary");
+        downloadBtn.classList.add("secondary");
+        loadGeojson(true);
+      });
+
+      loadGeojson(true);
+      setTimeout(() => map.invalidateSize(), 150);
+      window.addEventListener("resize", () => map.invalidateSize());
 
       function recolorSector(sectorId) {
         const layer = sectorLayers.get(sectorId);
