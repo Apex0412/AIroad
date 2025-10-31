@@ -79,6 +79,24 @@
         background: #e0e0e0;
       }
 
+      .info-box {
+        margin-top: 12px;
+        padding: 12px;
+        background: #e3f2fd;
+        border-radius: 6px;
+        border: 1px solid #bbdefb;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .info-box code {
+        display: inline-block;
+        background: rgba(25, 118, 210, 0.1);
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 12px;
+      }
+
       .legend {
         margin-top: 20px;
         border-top: 1px solid #eceff1;
@@ -127,6 +145,22 @@
         <p style="font-size: 14px; color: #607d8b; margin-bottom: 8px;">
           Цель: около {{ target_km|round(1) }} км на трактор. Всего тракторов: {{ tractors|length }}.
         </p>
+        <div class="info-box">
+          <strong>Google Directions API</strong>
+          <p style="margin: 6px 0 0;">
+            Перед запуском сервера установите ключ в переменную окружения
+            <code>GOOGLE_API_KEY</code>.
+          </p>
+          <p style="margin: 6px 0 0;">
+            Linux / macOS: <code>export GOOGLE_API_KEY="ВАШ_КЛЮЧ"</code><br />
+            Windows PowerShell: <code>$Env:GOOGLE_API_KEY = "ВАШ_КЛЮЧ"</code>
+          </p>
+          {% if google_key_present %}
+          <p style="margin: 6px 0 0; color: #1b5e20; font-weight: 600;">Ключ обнаружен на сервере.</p>
+          {% else %}
+          <p style="margin: 6px 0 0; color: #b71c1c; font-weight: 600;">Ключ сейчас не найден.</p>
+          {% endif %}
+        </div>
         {% if not google_key_present %}
         <p style="background:#ffecb3; padding:10px; border-radius:6px; font-size:13px;">
           <strong>Внимание:</strong> Google API ключ не найден. Переезды будут прямыми линиями.
