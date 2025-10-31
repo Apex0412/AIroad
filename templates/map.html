@@ -7,12 +7,12 @@
     <link
       rel="stylesheet"
       href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-      integrity="sha512-Rksm4b58ksH9dMRSf+T0Kp1xE7O9Kf6NWJzi10BGSAdoo6gWgfO2TUMpKyDJZH/5LiCFYl8a9kaGb0OQGa8mEA=="
+      integrity="sha256-u6Qi1p9sQzZ1W0OFu1Fx5x2CgX1+4wH730Pp47mC3yU="
       crossorigin=""
     />
     <script
       src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-      integrity="sha512-DomP3l7YfJZHF4RSbVSSMzdON3NofM8JrIoVNewc19hXtOD87bwo4V/mQJu1jLKYj1WFJsbgx5caX5/C7N44hA=="
+      integrity="sha256-o9N1jLBbN3oWsugprxOfG7J5Bl1BxZzmQZc3p3u4y+M="
       crossorigin=""
     ></script>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
@@ -31,7 +31,7 @@
 
       #layout {
         display: grid;
-        grid-template-columns: 320px 1fr;
+        grid-template-columns: 360px 1fr;
         height: 100vh;
         width: 100vw;
       }
@@ -46,16 +46,39 @@
       #map {
         width: 100%;
         height: 100%;
-        min-height: 100vh;
         background: #ddeaf6;
       }
 
       h1 {
         font-size: 20px;
         margin-top: 0;
+        margin-bottom: 8px;
       }
 
-      select,
+      h2 {
+        font-size: 15px;
+        margin-top: 20px;
+        margin-bottom: 8px;
+      }
+
+      label {
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+        margin-top: 12px;
+      }
+
+      input,
+      select {
+        width: 100%;
+        padding: 8px;
+        margin-top: 6px;
+        border: 1px solid #b0bec5;
+        border-radius: 6px;
+        font-size: 14px;
+        box-sizing: border-box;
+      }
+
       button {
         width: 100%;
         padding: 10px;
@@ -87,10 +110,6 @@
         background: #e0e0e0;
       }
 
-      .control-group {
-        margin-top: 14px;
-      }
-
       .hint {
         margin: 6px 0 0;
         font-size: 12px;
@@ -116,7 +135,7 @@
       }
 
       .legend {
-        margin-top: 20px;
+        margin-top: 16px;
         border-top: 1px solid #eceff1;
         padding-top: 10px;
       }
@@ -154,15 +173,40 @@
         font-size: 13px;
         color: #546e7a;
       }
+
+      .flex-row {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 10px;
+      }
+
+      .checkbox-row {
+        margin-top: 12px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .checkbox-row input {
+        width: auto;
+        margin-top: 0;
+      }
     </style>
   </head>
-  <body data-initial-grid-cells="{{ grid_cells }}" data-grid-error="{{ grid_error or '' }}">
+  <body
+    data-settings='{{ settings | tojson | safe }}'
+    data-grid-error='{{ grid_error or "" }}'
+    data-tractor-palette='{{ tractor_palette | tojson | safe }}'
+    data-initial-tractors='{{ tractors | tojson | safe }}'
+  >
     <div id="layout">
       <aside id="sidebar">
         <h1>Диспетчеризация тракторов</h1>
-        <p style="font-size: 14px; color: #607d8b; margin-bottom: 8px;">
-          Цель: около {{ target_km|round(1) }} км на трактор. Всего тракторов: {{ tractors|length }}.
-        </p>
+        <p style="font-size: 14px; color: #607d8b; margin-bottom: 8px;" id="target-summary"></p>
+        <p style="font-size: 13px; color: #607d8b; margin-top: 0;" id="center-summary"></p>
+
         <div class="info-box">
           <strong>Google Directions API</strong>
           <p style="margin: 6px 0 0;">
@@ -170,16 +214,11 @@
             добавьте строку <code>GOOGLE_API_KEY=ВАШ_КЛЮЧ</code>.
           </p>
           <p style="margin: 6px 0 0;">
-            Быстрый старт: <code>cp .env.example .env</code>, затем отредактируйте
-            файл и вставьте ключ.
+            Быстрый старт: <code>cp .env.example .env</code>, затем отредактируйте файл и вставьте ключ.
           </p>
           <p style="margin: 6px 0 0;">
             Текущий путь: <code>{{ dotenv_path }}</code>
-            {% if dotenv_exists %}
-            — файл найден.
-            {% else %}
-            — файл не найден.
-            {% endif %}
+            {% if dotenv_exists %} — файл найден.{% else %} — файл не найден.{% endif %}
           </p>
           {% if google_key_present %}
           <p style="margin: 6px 0 0; color: #1b5e20; font-weight: 600;">Ключ обнаружен на сервере.</p>
@@ -187,30 +226,73 @@
           <p style="margin: 6px 0 0; color: #b71c1c; font-weight: 600;">Ключ сейчас не найден.</p>
           {% endif %}
         </div>
-        {% if not google_key_present %}
-        <p style="background:#ffecb3; padding:10px; border-radius:6px; font-size:13px;">
-          <strong>Внимание:</strong> Google API ключ не найден. Переезды будут прямыми линиями.
-        </p>
-        {% endif %}
+
         {% if grid_error %}
         <p style="background:#ffccbc; padding:10px; border-radius:6px; font-size:13px;">
-          <strong>Ошибка сетки:</strong> {{ grid_error }}. Проверьте наличие файлов GEO.kml и RoadCity.kml и повторите попытку через выпадающее меню «Размер сетки».
+          <strong>Ошибка сетки:</strong> {{ grid_error }}. Проверьте наличие файлов GEO.kml и RoadCity.kml и перегенерируйте сетку через форму ниже.
         </p>
         {% endif %}
-        <div class="control-group">
-          <label for="grid-select" style="font-size: 13px; font-weight: 600;">Размер сетки</label>
-          <select id="grid-select">
-            {% if grid_cells not in grid_options %}
-            <option value="{{ grid_cells }}" selected>{{ grid_cells }} клеток</option>
-            {% endif %}
-            {% for option in grid_options %}
-            <option value="{{ option }}" {% if option == grid_cells %}selected{% endif %}>{{ option }} клеток</option>
-            {% endfor %}
-          </select>
-          <p class="hint">При смене сетки текущие назначения будут сброшены.</p>
+
+        <h2>Настройки расчёта</h2>
+        <label for="grid-select">Размер сетки</label>
+        <select id="grid-select">
+          {% if settings.grid_cells not in grid_options %}
+          <option value="{{ settings.grid_cells }}" selected>{{ settings.grid_cells }} клеток</option>
+          {% endif %}
+          {% for option in grid_options %}
+          <option value="{{ option }}" {% if option == settings.grid_cells %}selected{% endif %}>{{ option }} клеток</option>
+          {% endfor %}
+        </select>
+        <p class="hint">При смене сетки текущие назначения будут сброшены.</p>
+
+        <label for="n-units">Количество тракторов</label>
+        <input type="number" id="n-units" min="1" max="64" step="1" value="{{ settings.n_units }}" />
+
+        <label for="target-km">Целевая длина, км</label>
+        <input type="number" id="target-km" min="0.5" max="200" step="0.5" value="{{ settings.target_km }}" />
+
+        <label for="travel-mode">Режим переездов</label>
+        <select id="travel-mode">
+          {% set modes = ["driving", "walking", "bicycling", "transit"] %}
+          {% for mode in modes %}
+          <option value="{{ mode }}" {% if mode == settings.travel_mode %}selected{% endif %}>{{ mode }}</option>
+          {% endfor %}
+        </select>
+
+        <label for="max-waypoints">MAX waypoints</label>
+        <input type="number" id="max-waypoints" min="1" max="100" step="1" value="{{ settings.max_waypoints }}" />
+
+        <div class="checkbox-row">
+          <input type="checkbox" id="use-base" {% if settings.use_base_as_start %}checked{% endif %} />
+          <label for="use-base" style="margin: 0; font-weight: 600;">Стартовать от базы</label>
         </div>
 
-        <label for="tractor-select" style="font-size: 13px; font-weight: 600;">Выберите трактор</label>
+        <div class="flex-row">
+          <div>
+            <label for="base-lat">База LAT</label>
+            <input type="number" id="base-lat" step="0.000001" value="{{ settings.base_lat }}" />
+          </div>
+          <div>
+            <label for="base-lon">База LON</label>
+            <input type="number" id="base-lon" step="0.000001" value="{{ settings.base_lon }}" />
+          </div>
+        </div>
+
+        <div class="flex-row">
+          <div>
+            <label for="center-lat">Центр LAT</label>
+            <input type="number" id="center-lat" step="0.000001" value="{{ settings.center_lat }}" />
+          </div>
+          <div>
+            <label for="center-lon">Центр LON</label>
+            <input type="number" id="center-lon" step="0.000001" value="{{ settings.center_lon }}" />
+          </div>
+        </div>
+
+        <button id="apply-settings" class="secondary">Применить параметры</button>
+
+        <h2>Распределение клеток</h2>
+        <label for="tractor-select">Выберите трактор</label>
         <select id="tractor-select">
           {% for tractor in tractors %}
           <option value="{{ tractor.id }}" data-color="{{ tractor.color }}">{{ tractor.name }}</option>
@@ -221,19 +303,10 @@
         <button id="build" class="primary">💾 Сохранить и построить</button>
         <button id="download" class="secondary" disabled>⬇️ Скачать KML</button>
 
-        <div class="legend">
-          <h2 style="font-size: 15px; margin-bottom: 6px;">Легенда</h2>
-          {% for tractor in tractors %}
-          <div class="legend-item">
-            <span class="legend-color" style="background: {{ tractor.color }}"></span>
-            <span>{{ tractor.name }}</span>
-          </div>
-          {% endfor %}
-        </div>
+        <div class="legend" id="legend"></div>
 
         <div class="status">
-          <div>Клеток в сетке: <span id="grid-count">{{ grid_cells }}</span></div>
-          <div>Карта центрирована в точке {{ center_lat }}, {{ center_lon }}</div>
+          <div>Клеток в сетке: <span id="grid-count"></span></div>
         </div>
 
         <div id="log"></div>
@@ -242,8 +315,12 @@
     </div>
 
     <script>
-      const map = L.map("map").setView([{{ center_lat }}, {{ center_lon }}], 12.5);
+      const settingsState = JSON.parse(document.body.dataset.settings || "{}");
+      const tractorPalette = JSON.parse(document.body.dataset.tractorPalette || "[]");
+      let tractorList = JSON.parse(document.body.dataset.initialTractors || "[]");
+      const socket = io();
 
+      const map = L.map("map").setView([settingsState.center_lat || 0, settingsState.center_lon || 0], 12.5);
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
         maxZoom: 18,
         attribution: '&copy; <a href="https://www.openstreetmap.org/">OpenStreetMap</a> contributors',
@@ -252,6 +329,7 @@
       const assignments = {};
       const sectorLayers = new Map();
       const tractorSelect = document.getElementById("tractor-select");
+      const legendContainer = document.getElementById("legend");
       const gridSelect = document.getElementById("grid-select");
       const gridCountLabel = document.getElementById("grid-count");
       const logEl = document.getElementById("log");
@@ -259,17 +337,27 @@
       const buildBtn = document.getElementById("build");
       const clearBtn = document.getElementById("clear-tractor");
       const resetBtn = document.getElementById("reset-all");
-      const tractorColors = {};
-      Array.from(tractorSelect.options).forEach((option) => {
-        tractorColors[option.value] = option.dataset.color;
-      });
+      const applySettingsBtn = document.getElementById("apply-settings");
+      const nUnitsInput = document.getElementById("n-units");
+      const targetKmInput = document.getElementById("target-km");
+      const travelModeInput = document.getElementById("travel-mode");
+      const maxWaypointsInput = document.getElementById("max-waypoints");
+      const useBaseCheckbox = document.getElementById("use-base");
+      const baseLatInput = document.getElementById("base-lat");
+      const baseLonInput = document.getElementById("base-lon");
+      const centerLatInput = document.getElementById("center-lat");
+      const centerLonInput = document.getElementById("center-lon");
+      const targetSummary = document.getElementById("target-summary");
+      const centerSummary = document.getElementById("center-summary");
 
-      const socket = io();
+      const tractorColors = {};
+      rebuildTractorControls(tractorList);
+      applySettingsSummary();
+      updateGridIndicators();
+
       const initialGridError = (document.body.dataset.gridError || "").trim();
-      const initialGridCells = Number(document.body.dataset.initialGridCells || 0);
-      let currentGridCells = Number.isFinite(initialGridCells) && initialGridCells > 0 ? initialGridCells : 0;
+      let currentGridCells = Number(settingsState.grid_cells) || 0;
       let geoLayer = null;
-      let pendingGridSelection = null;
 
       socket.on("assignments", (data) => {
         Object.keys(assignments).forEach((key) => delete assignments[key]);
@@ -304,9 +392,86 @@
         }
       });
 
+      socket.on("settings", ({ settings, tractors }) => {
+        if (settings && typeof settings === "object") {
+          Object.assign(settingsState, settings);
+          updateGridIndicators();
+          applySettingsSummary();
+          applySettingsToForm();
+          currentGridCells = Number(settingsState.grid_cells) || currentGridCells;
+        }
+        if (Array.isArray(tractors)) {
+          tractorList = tractors;
+          rebuildTractorControls(tractorList);
+          recolorAll();
+        }
+        downloadBtn.disabled = true;
+        downloadBtn.classList.remove("primary");
+        downloadBtn.classList.add("secondary");
+        loadGeojson(true);
+      });
+
+      function rebuildTractorControls(list) {
+        const previousSelection = tractorSelect.value;
+        tractorSelect.innerHTML = "";
+        legendContainer.innerHTML = "<h2 style=\"margin-top:0;\">Легенда</h2>";
+        const colors = {};
+        list.forEach((tractor) => {
+          const option = document.createElement("option");
+          option.value = tractor.id;
+          option.textContent = tractor.name;
+          option.dataset.color = tractor.color;
+          tractorSelect.appendChild(option);
+          const legendItem = document.createElement("div");
+          legendItem.className = "legend-item";
+          legendItem.innerHTML = `<span class="legend-color" style="background:${tractor.color}"></span><span>${tractor.name}</span>`;
+          legendContainer.appendChild(legendItem);
+          colors[tractor.id] = tractor.color;
+        });
+        Object.assign(tractorColors, colors);
+        if (previousSelection && colors[previousSelection]) {
+          tractorSelect.value = previousSelection;
+        }
+      }
+
+      function applySettingsToForm() {
+        nUnitsInput.value = settingsState.n_units || 1;
+        targetKmInput.value = settingsState.target_km || 30;
+        travelModeInput.value = settingsState.travel_mode || "driving";
+        maxWaypointsInput.value = settingsState.max_waypoints || 23;
+        useBaseCheckbox.checked = Boolean(settingsState.use_base_as_start);
+        baseLatInput.value = settingsState.base_lat || 0;
+        baseLonInput.value = settingsState.base_lon || 0;
+        centerLatInput.value = settingsState.center_lat || 0;
+        centerLonInput.value = settingsState.center_lon || 0;
+        if (gridSelect && settingsState.grid_cells) {
+          gridSelect.value = String(settingsState.grid_cells);
+        }
+      }
+
+      function applySettingsSummary() {
+        const targetText = settingsState.target_km ? `Цель: около ${Number(settingsState.target_km).toFixed(1)} км на трактор.` : "";
+        const tractorsText = settingsState.n_units ? ` Всего тракторов: ${settingsState.n_units}.` : "";
+        targetSummary.textContent = targetText + tractorsText;
+        if (settingsState.center_lat && settingsState.center_lon) {
+          centerSummary.textContent = `Карта центрирована в точке ${settingsState.center_lat}, ${settingsState.center_lon}`;
+        } else {
+          centerSummary.textContent = "";
+        }
+        if (map && settingsState.center_lat && settingsState.center_lon) {
+          map.setView([settingsState.center_lat, settingsState.center_lon], map.getZoom());
+        }
+      }
+
+      function updateGridIndicators() {
+        if (gridCountLabel) {
+          gridCountLabel.textContent = settingsState.grid_cells || "?";
+        }
+      }
+
       function loadGeojson(showLog = false) {
         if (showLog) {
-          appendLog(`Загружаю сетку (${currentGridCells || "?"} клеток)...`);
+          appendLog(`Загружаю сетку (${settingsState.grid_cells || "?"} клеток)...`);
         }
         if (geoLayer) {
           map.removeLayer(geoLayer);
@@ -322,7 +487,7 @@
           })
           .then((geojson) => {
             geoLayer = L.geoJSON(geojson, {
-              style: (feature) => ({
+              style: () => ({
                 color: "#b0bec5",
                 weight: 1,
                 fillOpacity: 0.2,
@@ -381,43 +546,26 @@
           if (!Number.isFinite(selected) || selected <= 0 || selected === currentGridCells) {
             return;
           }
-          pendingGridSelection = selected;
-          gridSelect.disabled = true;
           appendLog(`Запрашиваю сетку на ${selected} клеток...`);
-          fetch("/grid", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ grid_cells: selected }),
-          })
-            .then((resp) => resp.json().then((data) => ({ ok: resp.ok, data })))
-            .then(({ ok, data }) => {
-              if (!ok) {
-                throw new Error(data?.error || "Не удалось обновить сетку");
-              }
-              const updated = Number(data?.grid_cells);
-              if (Number.isFinite(updated)) {
-                currentGridCells = updated;
-                if (gridCountLabel) {
-                  gridCountLabel.textContent = updated;
-                }
-              }
-              downloadBtn.disabled = true;
-              downloadBtn.classList.remove("primary");
-              downloadBtn.classList.add("secondary");
-              appendLog("Сетка будет перезагружена – назначения очищены.");
-            })
-            .catch((error) => {
-              appendLog(`Ошибка обновления сетки: ${error.message}`);
-              if (pendingGridSelection !== null && Number.isFinite(currentGridCells)) {
-                gridSelect.value = String(currentGridCells);
-              }
-              pendingGridSelection = null;
-            })
-            .finally(() => {
-              gridSelect.disabled = false;
-            });
+          submitSettings({ grid_cells: selected });
         });
       }
+
+      applySettingsBtn.addEventListener("click", () => {
+        const payload = {
+          n_units: Number(nUnitsInput.value),
+          target_km: Number(targetKmInput.value),
+          travel_mode: travelModeInput.value,
+          max_waypoints: Number(maxWaypointsInput.value),
+          use_base_as_start: useBaseCheckbox.checked,
+          base_lat: Number(baseLatInput.value),
+          base_lon: Number(baseLonInput.value),
+          center_lat: Number(centerLatInput.value),
+          center_lon: Number(centerLonInput.value),
+        };
+        appendLog("Отправляю обновлённые параметры...");
+        submitSettings(payload);
+      });
 
       buildBtn.addEventListener("click", () => {
         buildBtn.disabled = true;
@@ -447,28 +595,51 @@
         window.location.href = "/download";
       });
 
-      socket.on("grid_settings", ({ grid_cells: value }) => {
-        const parsed = Number(value);
-        if (!Number.isFinite(parsed) || parsed <= 0) {
-          return;
-        }
-        currentGridCells = parsed;
-        pendingGridSelection = null;
-        if (gridSelect && Number(gridSelect.value) !== parsed) {
-          gridSelect.value = String(parsed);
-        }
-        if (gridCountLabel) {
-          gridCountLabel.textContent = parsed;
-        }
-        downloadBtn.disabled = true;
-        downloadBtn.classList.remove("primary");
-        downloadBtn.classList.add("secondary");
-        loadGeojson(true);
-      });
+      function submitSettings(payload) {
+        return fetch("/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        })
+          .then((resp) => resp.json().then((data) => ({ ok: resp.ok, data })))
+          .then(({ ok, data }) => {
+            if (!ok) {
+              throw new Error(data?.error || "Не удалось обновить параметры");
+            }
+            appendLog("Параметры обновлены на сервере");
+            if (data?.settings) {
+              Object.assign(settingsState, data.settings);
+              applySettingsSummary();
+              applySettingsToForm();
+              updateGridIndicators();
+              currentGridCells = Number(settingsState.grid_cells) || currentGridCells;
+            }
+            if (Array.isArray(data?.tractors)) {
+              tractorList = data.tractors;
+              rebuildTractorControls(tractorList);
+              recolorAll();
+            }
+            if (data?.assignments_cleared) {
+              Object.keys(assignments).forEach((key) => delete assignments[key]);
+              recolorAll();
+            }
+            downloadBtn.disabled = true;
+            downloadBtn.classList.remove("primary");
+            downloadBtn.classList.add("secondary");
+            loadGeojson(true);
+          })
+          .catch((error) => {
+            appendLog(`Ошибка обновления настроек: ${error.message}`);
+            if (gridSelect) {
+              gridSelect.value = String(settingsState.grid_cells || gridSelect.value);
+            }
+          });
+      }
 
       if (initialGridError) {
         appendLog(`Ошибка подготовки сетки: ${initialGridError}`);
       }
+      applySettingsToForm();
       loadGeojson(true);
       setTimeout(() => map.invalidateSize(), 150);
       window.addEventListener("resize", () => map.invalidateSize());
@@ -482,8 +653,8 @@
           layer.bindTooltip(`${sectorId}: не назначено`, { sticky: true });
           return;
         }
-        const option = tractorSelect.querySelector(`option[value="${tractorId}"]`);
         const color = tractorColors[tractorId] || "#90a4ae";
+        const option = Array.from(tractorSelect.options).find((opt) => opt.value === tractorId);
         layer.setStyle({ fillColor: color, fillOpacity: 0.45 });
         layer.bindTooltip(`${sectorId}: ${option?.textContent || tractorId}`, { sticky: true });
       }

@@ -28,45 +28,46 @@ from tqdm import tqdm
 import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
 
+from config_defaults import BuildDefaults, TRACTOR_COLORS
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env", override=True)
-
-# ---------------------------------------------------------------------------
-# Configuration parameters – tweak here to adjust behaviour globally.
-# ---------------------------------------------------------------------------
-N_UNITS: int = 18
-TARGET_M: float = 30_000.0
-GRID_CELLS: int = 64
-GRID_CELL_OPTIONS: List[int] = [64, 100, 144, 196]
 GOOGLE_API_KEY: Optional[str] = os.getenv("GOOGLE_API_KEY")
-TRAVEL_MODE: str = "driving"
-MAX_WAYPOINTS: int = 23
-USE_BASE_AS_START: bool = True
-BASE_LAT: float = 55.751244  # Example: Moscow centre
-BASE_LON: float = 37.618423
-CENTER_LAT: float = BASE_LAT
-CENTER_LON: float = BASE_LON
-TRACTOR_COLORS: List[str] = [
-    "#d32f2f",
-    "#c2185b",
-    "#7b1fa2",
-    "#512da8",
-    "#303f9f",
-    "#1976d2",
-    "#0288d1",
-    "#0097a7",
-    "#00796b",
-    "#388e3c",
-    "#689f38",
-    "#afb42b",
-    "#fbc02d",
-    "#ffa000",
-    "#f57c00",
-    "#e64a19",
-    "#5d4037",
-    "#455a64",
-]
 
+
+@dataclass
+class BuildSettings:
+
+    """Runtime configuration supplied by the web UI or CLI."""
+
+    n_units: int
+    target_m: float
+    grid_cells: int
+    travel_mode: str
+    max_waypoints: int
+    use_base_as_start: bool
+    base_lat: float
+    base_lon: float
+    center_lat: float
+    center_lon: float
+
+    @classmethod
+    def from_defaults(cls, defaults: BuildDefaults) -> "BuildSettings":
+        return cls(
+            n_units=defaults.n_units,
+            target_m=defaults.target_km * 1000,
+            grid_cells=defaults.grid_cells,
+            travel_mode=defaults.travel_mode,
+            max_waypoints=defaults.max_waypoints,
+            use_base_as_start=defaults.use_base_as_start,
+            base_lat=defaults.base_lat,
+            base_lon=defaults.base_lon,
+            center_lat=defaults.center_lat,
+            center_lon=defaults.center_lon,
+        )
+
+
+DEFAULTS = BuildDefaults()
 # ---------------------------------------------------------------------------
 # Data classes used in the build process.
 # ---------------------------------------------------------------------------
@@ -370,9 +371,12 @@ def build_routes_with_assignments(
     cells: Sequence[Cell],
     assignments: Dict[str, str],
     output_path: Path,
+    settings: BuildSettings,
 ) -> List[RouteResult]:
     print_stage("[6/8] Строю маршруты по назначенным клеткам")
-    assignments_by_tractor: Dict[str, List[str]] = {f"tractor_{i+1:02d}": [] for i in range(N_UNITS)}
+    assignments_by_tractor: Dict[str, List[str]] = {
+        f"tractor_{i+1:02d}": [] for i in range(settings.n_units)
+    }
     for cell_id, tractor_id in assignments.items():
         if tractor_id not in assignments_by_tractor:
             continue
@@ -382,13 +386,13 @@ def build_routes_with_assignments(
     unvisited: set[str] = {segment.identifier for segment in segments}
     routes: List[RouteResult] = []
 
-    if USE_BASE_AS_START:
-        current_base = (BASE_LON, BASE_LAT)
+    if settings.use_base_as_start:
+        current_base = (settings.base_lon, settings.base_lat)
     else:
         zone_centroid = unary_union([cell.polygon for cell in cells]).centroid
         current_base = (zone_centroid.x, zone_centroid.y)
 
-    for idx in range(N_UNITS):
+    for idx in range(settings.n_units):
         tractor_id = f"tractor_{idx+1:02d}"
         tractor_name = f"Трактор {idx+1:02d}"
         tractor_color = TRACTOR_COLORS[idx % len(TRACTOR_COLORS)]
@@ -400,7 +404,7 @@ def build_routes_with_assignments(
         current_point = current_base
 
         def remaining_segments(candidate_cells: Optional[set[str]] = None) -> List[RoadSegment]:
-            result = []
+            result: List[RoadSegment] = []
             for seg_id in unvisited:
                 seg = segments_by_id[seg_id]
                 if candidate_cells is None:
@@ -409,7 +413,7 @@ def build_routes_with_assignments(
                     result.append(seg)
             return result
 
-        while route_length < TARGET_M and unvisited:
+        while route_length < settings.target_m and unvisited:
             primary = remaining_segments(allowed_cells) if allowed_cells else []
             candidate_segments = primary
             if not candidate_segments:
@@ -426,7 +430,12 @@ def build_routes_with_assignments(
                 break
 
             start_coord = tuple(map(float, next_segment.geometry.coords[0]))
-            travel_segment = build_transition_path(current_point, start_coord)
+            travel_segment = build_transition_path(
+                current_point,
+                start_coord,
+                travel_mode=settings.travel_mode,
+                max_waypoints=settings.max_waypoints,
+            )
             if travel_segment:
                 route_segments.append(travel_segment.copy())
                 travel_length = _line_length_m(travel_segment)
@@ -460,7 +469,12 @@ def build_routes_with_assignments(
             + f"[7/8] Внимание: {len(unvisited)} линий не попало в маршруты, добавляю к самым коротким."
             + Style.RESET_ALL
         )
-        distribute_remaining_segments(unvisited, segments_by_id, routes)
+        distribute_remaining_segments(
+            unvisited,
+            segments_by_id,
+            routes,
+            settings=settings,
+        )
 
     write_routes_kml(routes, output_path)
     print_stage("[8/8] Готово: routes_grid.kml создан")
@@ -491,20 +505,26 @@ def _select_nearest_segment(
 def build_transition_path(
     start_point: Tuple[float, float],
     end_point: Tuple[float, float],
+    travel_mode: str,
+    max_waypoints: int,
 ) -> List[Tuple[float, float]]:
     """Build a travel path between segments using Google Directions if available."""
 
     if start_point == end_point:
         return []
 
-    if not GOOGLE_API_KEY:
+    if not GOOGLE_API_KEY or not travel_mode:
         return [start_point, end_point]
+
+    # Google Directions API currently supports only a handful of waypoints in a
+    # single request. The max_waypoints value is accepted from settings so the
+    # caller can adjust future batching logic without changing this function.
 
     params = {
         "origin": f"{start_point[1]},{start_point[0]}",
         "destination": f"{end_point[1]},{end_point[0]}",
         "key": GOOGLE_API_KEY,
-        "mode": TRAVEL_MODE,
+        "mode": travel_mode,
     }
 
     try:
@@ -540,6 +560,8 @@ def distribute_remaining_segments(
     remaining_ids: Iterable[str],
     segments_by_id: Dict[str, RoadSegment],
     routes: List[RouteResult],
+    *,
+    settings: BuildSettings,
 ) -> None:
     processed = list(remaining_ids)
     for seg_id in processed:
@@ -548,11 +570,18 @@ def distribute_remaining_segments(
         last_point: Tuple[float, float]
         if target_route.coordinates and target_route.coordinates[-1]:
             last_point = tuple(target_route.coordinates[-1][-1])
+        elif settings.use_base_as_start:
+            last_point = (settings.base_lon, settings.base_lat)
         else:
-            last_point = (BASE_LON, BASE_LAT) if USE_BASE_AS_START else (CENTER_LON, CENTER_LAT)
+            last_point = (settings.center_lon, settings.center_lat)
 
         start_coord = tuple(map(float, segment.geometry.coords[0]))
-        travel_segment = build_transition_path(last_point, start_coord)
+        travel_segment = build_transition_path(
+            last_point,
+            start_coord,
+            travel_mode=settings.travel_mode,
+            max_waypoints=settings.max_waypoints,
+        )
         if travel_segment:
             target_route.coordinates.append(travel_segment.copy())
             target_route.total_length += _line_length_m(travel_segment)
@@ -630,14 +659,75 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--grid-cells",
         type=int,
-        default=GRID_CELLS,
-        help="Количество ячеек сетки (по умолчанию соответствует конфигурации)",
+        default=DEFAULTS.grid_cells,
+        help="Количество ячеек сетки",
     )
+    parser.add_argument(
+        "--n-units",
+        type=int,
+        default=DEFAULTS.n_units,
+        help="Количество тракторов",
+    )
+    parser.add_argument(
+        "--target-km",
+        type=float,
+        default=DEFAULTS.target_km,
+        help="Целевая длина маршрута на трактор (в километрах)",
+    )
+    parser.add_argument(
+        "--travel-mode",
+        type=str,
+        default=DEFAULTS.travel_mode,
+        help="Режим Google Directions API",
+    )
+    parser.add_argument(
+        "--max-waypoints",
+        type=int,
+        default=DEFAULTS.max_waypoints,
+        help="Максимальное число промежуточных точек для Google Directions",
+    )
+    parser.add_argument(
+        "--use-base-start",
+        dest="use_base_start",
+        action="store_true",
+        default=DEFAULTS.use_base_as_start,
+        help="Стартовать от базы",
+    )
+    parser.add_argument(
+        "--no-use-base-start",
+        dest="use_base_start",
+        action="store_false",
+        help="Игнорировать базу и стартовать из центра зоны",
+    )
+    parser.add_argument("--base-lat", type=float, default=DEFAULTS.base_lat)
+    parser.add_argument("--base-lon", type=float, default=DEFAULTS.base_lon)
+    parser.add_argument("--center-lat", type=float, default=DEFAULTS.center_lat)
+    parser.add_argument("--center-lon", type=float, default=DEFAULTS.center_lon)
     return parser.parse_args(argv)
+
+
+def build_settings_from_args(args: argparse.Namespace) -> BuildSettings:
+    n_units = max(1, int(args.n_units))
+    target_m = max(1.0, float(args.target_km) * 1000.0)
+    grid_cells = max(1, int(args.grid_cells))
+    max_waypoints = max(1, int(args.max_waypoints))
+    return BuildSettings(
+        n_units=n_units,
+        target_m=target_m,
+        grid_cells=grid_cells,
+        travel_mode=str(args.travel_mode or "").strip(),
+        max_waypoints=max_waypoints,
+        use_base_as_start=bool(args.use_base_start),
+        base_lat=float(args.base_lat),
+        base_lon=float(args.base_lon),
+        center_lat=float(args.center_lat),
+        center_lon=float(args.center_lon),
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
+    settings = build_settings_from_args(args)
 
     if not GOOGLE_API_KEY:
         print_stage(
@@ -648,9 +738,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     try:
         zone = parse_geo_boundary(args.geo)
-        grid_cells = max(1, args.grid_cells or GRID_CELLS)
-        cells = build_grid(zone, grid_cells)
-        save_cells_geojson(cells, Path("static") / "sectors.geojson", grid_cells)
+        cells = build_grid(zone, settings.grid_cells)
+        save_cells_geojson(cells, Path("static") / "sectors.geojson", settings.grid_cells)
     except Exception as exc:  # noqa: BLE001
         print_stage(Fore.RED + f"Ошибка подготовки сетки: {exc}" + Style.RESET_ALL)
         raise
@@ -668,11 +757,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     try:
         assignments = load_assignments(args.assignments)
-        build_routes_with_assignments(segments, cells, assignments, args.output)
+        build_routes_with_assignments(segments, cells, assignments, args.output, settings)
     except Exception as exc:  # noqa: BLE001
         print_stage(Fore.RED + f"Ошибка построения маршрутов: {exc}" + Style.RESET_ALL)
         raise
-
 
 if __name__ == "__main__":
     main()
