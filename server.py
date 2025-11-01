@@ -147,6 +147,26 @@ def refresh_env() -> None:
         load_dotenv(_dotenv_path, override=True)
 
 
+def set_grid_error(message: Optional[str]) -> None:
+    """Persist the latest grid error and notify connected clients."""
+
+    global _grid_error
+    cleaned = str(message).strip() if message else None
+    if _grid_error == cleaned:
+        return
+    if cleaned:
+        app.logger.error("Сетка недоступна: %s", cleaned)
+    else:
+        app.logger.info("Состояние сетки: ошибок не обнаружено")
+    _grid_error = cleaned
+    payload = {"message": cleaned}
+    try:
+        socketio.emit("grid_error", payload, broadcast=True)
+    except RuntimeError:
+        # Во время инициализации Flask-SocketIO может ещё не быть готов для отправки.
+        pass
+
+
 def load_assignments() -> Dict[str, str]:
     if ASSIGNMENTS_PATH.exists():
         try:
@@ -178,21 +198,20 @@ def prune_assignments(settings: Dict[str, Any]) -> None:
 
 def ensure_grid_exists(grid_cells: Optional[int] = None, force: bool = False) -> None:
     desired_cells = grid_cells or int(_current_settings.get("grid_cells") or DEFAULTS.grid_cells)
-    if not force and SECTORS_GEOJSON.exists():
+
+    if SECTORS_GEOJSON.exists() and not force:
         try:
-            data = json.loads(SECTORS_GEOJSON.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
+            cached = json.loads(SECTORS_GEOJSON.read_text(encoding="utf-8"))
+            features = cached.get("features") if isinstance(cached, dict) else None
+            metadata = cached.get("metadata") if isinstance(cached, dict) else None
+            stored_grid = None
+            if isinstance(metadata, dict) and metadata.get("grid_cells") is not None:
+                stored_grid = int(metadata["grid_cells"])
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
             app.logger.info("Сетка повреждена, требуется перегенерация: %s", exc)
         else:
-            features = data.get("features")
-            meta = data.get("metadata") if isinstance(data, dict) else None
-            stored_grid = None
-            if isinstance(meta, dict) and "grid_cells" in meta:
-                try:
-                    stored_grid = int(meta["grid_cells"])
-                except (TypeError, ValueError):
-                    stored_grid = None
             if features and stored_grid == desired_cells:
+                set_grid_error(None)
                 return
             reason = []
             if not features:
@@ -203,6 +222,17 @@ def ensure_grid_exists(grid_cells: Optional[int] = None, force: bool = False) ->
                 "Перегенерация сетки: %s",
                 "; ".join(reason) if reason else "требуется обновление",
             )
+
+    missing_inputs = [str(path.name) for path in (GEO_PATH, ROADS_PATH) if not path.exists()]
+    if missing_inputs:
+        message = (
+            "Не найдены входные файлы: "
+            + ", ".join(missing_inputs)
+            + ". Поместите GEO.kml и RoadCity.kml в корень проекта."
+        )
+        set_grid_error(message)
+        raise FileNotFoundError(message)
+
     app.logger.info("Генерация сетки (%s клеток)...", desired_cells)
     args = [
         os.sys.executable,
@@ -216,12 +246,64 @@ def ensure_grid_exists(grid_cells: Optional[int] = None, force: bool = False) ->
         str(desired_cells),
     ]
     try:
-        subprocess.run(args, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        app.logger.error("Не удалось сгенерировать сетку", exc_info=exc)
-        raise RuntimeError("Ошибка генерации сетки") from exc
+        result = subprocess.run(
+            args,
+            check=True,
+            cwd=APP_ROOT,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        message = "Не найден интерпретатор Python для запуска генерации сетки"
+        set_grid_error(message)
+        raise RuntimeError(message) from exc
+    except subprocess.CalledProcessError as exc:
+        combined = "\n".join(part for part in [exc.stdout, exc.stderr] if part)
+        tail = combined.strip().splitlines()[-1] if combined.strip() else ""
+        message = f"route_builder_grid_v7_1.py завершился с кодом {exc.returncode}"
+        if tail:
+            message = f"{message}: {tail}"
+        set_grid_error(message)
+        raise RuntimeError(message) from exc
+    else:
+        output = (result.stdout or "").strip()
+        if output:
+            for line in output.splitlines():
+                app.logger.info("[grid] %s", line)
+
     if not SECTORS_GEOJSON.exists():
-        raise RuntimeError("Файл sectors.geojson не создан")
+        message = "route_builder_grid_v7_1.py не создал static/sectors.geojson"
+        set_grid_error(message)
+        raise RuntimeError(message)
+
+    try:
+        generated = json.loads(SECTORS_GEOJSON.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        message = "Не удалось прочитать сгенерированный GeoJSON сетки"
+        set_grid_error(message)
+        raise RuntimeError(message) from exc
+
+    features = generated.get("features") if isinstance(generated, dict) else None
+    metadata = generated.get("metadata") if isinstance(generated, dict) else None
+    stored_grid = None
+    if isinstance(metadata, dict) and metadata.get("grid_cells") is not None:
+        try:
+            stored_grid = int(metadata["grid_cells"])
+        except (TypeError, ValueError):
+            stored_grid = None
+
+    if not features:
+        message = "Сетка сформирована, но не содержит полигонов"
+        set_grid_error(message)
+        raise RuntimeError(message)
+    if stored_grid != desired_cells:
+        message = (
+            f"Размер сетки в GeoJSON ({stored_grid}) не совпадает с запросом ({desired_cells})"
+        )
+        set_grid_error(message)
+        raise RuntimeError(message)
+
+    set_grid_error(None)
 
 
 def initialize_state() -> None:
@@ -239,9 +321,8 @@ def initialize_state() -> None:
     try:
         app.logger.info("Проверяю наличие сетки (%s клеток)", _current_settings.get("grid_cells"))
         ensure_grid_exists(_current_settings.get("grid_cells"))
-        _grid_error = None
     except Exception as exc:  # noqa: BLE001
-        _grid_error = str(exc)
+        set_grid_error(str(exc))
         app.logger.error("Ошибка генерации сетки", exc_info=exc)
     with _assignments_lock:
         _current_assignments.clear()
@@ -310,6 +391,8 @@ def run_builder() -> Response:
     refresh_env()
     if not GEO_PATH.exists() or not ROADS_PATH.exists():
         return jsonify({"error": "Файлы GEO.kml и RoadCity.kml должны находиться в корне проекта"}), 400
+    if _grid_error:
+        return jsonify({"error": f"Сетка недоступна: {_grid_error}"}), 400
     data = request.get_json(force=True, silent=True) or {}
     assignments = data.get("assignments", {}) if isinstance(data, dict) else {}
     if not isinstance(assignments, dict):
@@ -334,7 +417,7 @@ def _background_build() -> None:
         refresh_env()
         settings_snapshot = with_settings_copy()
         ensure_grid_exists(settings_snapshot.get("grid_cells"), force=True)
-        _grid_error = None
+        set_grid_error(None)
         args = [
             os.sys.executable,
             str(APP_ROOT / "route_builder_grid_v7_1.py"),
@@ -370,6 +453,7 @@ def _background_build() -> None:
         else:
             args.append("--no-use-base-start")
         app.logger.info("Запускаю построение маршрутов")
+        socketio.emit("build_status", {"running": True}, broadcast=True)
         process = subprocess.Popen(
             args,
             cwd=APP_ROOT,
@@ -392,10 +476,11 @@ def _background_build() -> None:
             socketio.emit("progress", {"message": f"Ошибка построения (код {returncode})"})
             socketio.emit("build_done", {"success": False})
     except Exception as exc:  # noqa: BLE001
-        _grid_error = str(exc)
+        set_grid_error(str(exc))
         socketio.emit("progress", {"message": f"Исключение: {exc}"})
         socketio.emit("build_done", {"success": False})
     finally:
+        socketio.emit("build_status", {"running": False}, broadcast=True)
         _build_lock.release()
 
 
@@ -409,6 +494,7 @@ def update_settings() -> Response:
         new_settings = dict(_current_settings)
     changed: Dict[str, Any] = {}
     errors: list[str] = []
+    grid_requested = data.get("grid_cells") if "grid_cells" in data else None
     for key, value in data.items():
         try:
             if key == "grid_cells":
@@ -437,16 +523,17 @@ def update_settings() -> Response:
             changed[key] = new_value
     if errors:
         return jsonify({"error": "; ".join(errors)}), 400
-    if not changed:
-        return jsonify({"status": "unchanged", "settings": new_settings})
+    if not changed and not (_grid_error and grid_requested is not None):
+        return jsonify({"status": "unchanged", "settings": new_settings, "grid_error": _grid_error})
 
     grid_changed = "grid_cells" in changed
     n_units_changed = "n_units" in changed
 
-    if grid_changed:
+    if grid_changed or (_grid_error and grid_requested is not None):
         try:
-            ensure_grid_exists(changed["grid_cells"], force=True)
+            ensure_grid_exists(int(new_settings["grid_cells"]), force=True)
         except Exception as exc:  # noqa: BLE001
+            set_grid_error(str(exc))
             return jsonify({"error": f"Не удалось сформировать сетку: {exc}"}), 500
 
     with _settings_lock:
@@ -467,11 +554,27 @@ def update_settings() -> Response:
             assignments_cleared = len(_current_assignments) < before
 
     settings_snapshot = with_settings_copy()
-    socketio.emit("settings", {"settings": settings_snapshot, "tractors": tractors_for_settings(settings_snapshot)}, broadcast=True)
+    socketio.emit(
+        "settings",
+        {
+            "settings": settings_snapshot,
+            "tractors": tractors_for_settings(settings_snapshot),
+            "grid_error": _grid_error,
+        },
+        broadcast=True,
+    )
     if assignments_cleared:
         socketio.emit("assignments", _current_assignments, broadcast=True)
 
-    return jsonify({"status": "ok", "settings": settings_snapshot, "tractors": tractors_for_settings(settings_snapshot), "assignments_cleared": assignments_cleared})
+    return jsonify(
+        {
+            "status": "ok",
+            "settings": settings_snapshot,
+            "tractors": tractors_for_settings(settings_snapshot),
+            "assignments_cleared": assignments_cleared,
+            "grid_error": _grid_error,
+        }
+    )
 
 
 @socketio.on("connect")
@@ -479,7 +582,15 @@ def handle_connect():
     initialize_state()
     emit("assignments", _current_assignments)
     snapshot = with_settings_copy()
-    emit("settings", {"settings": snapshot, "tractors": tractors_for_settings(snapshot)})
+    emit(
+        "settings",
+        {
+            "settings": snapshot,
+            "tractors": tractors_for_settings(snapshot),
+            "grid_error": _grid_error,
+        },
+    )
+    emit("grid_error", {"message": _grid_error})
 
 
 @socketio.on("assign_sector")

@@ -114,6 +114,25 @@
         color: #607d8b;
       }
 
+      .alert {
+        margin-top: 12px;
+        padding: 12px;
+        border-radius: 6px;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .alert strong {
+        display: block;
+        margin-bottom: 4px;
+      }
+
+      .alert-error {
+        background: #ffebee;
+        border: 1px solid #ef9a9a;
+        color: #b71c1c;
+      }
+
       .info-box {
         margin-top: 12px;
         padding: 12px;
@@ -225,11 +244,18 @@
           {% endif %}
         </div>
 
-        {% if grid_error %}
-        <p style="background:#ffccbc; padding:10px; border-radius:6px; font-size:13px;">
-          <strong>Ошибка сетки:</strong> {{ grid_error }}. Проверьте наличие файлов GEO.kml и RoadCity.kml и перегенерируйте сетку через форму ниже.
-        </p>
-        {% endif %}
+        <div
+          id="grid-error-banner"
+          class="alert alert-error"
+          {% if not grid_error %}style="display: none;"{% endif %}
+        >
+          <strong>Ошибка сетки</strong>
+          <span id="grid-error-text">{{ grid_error or "" }}</span>
+          <div class="hint">
+            Проверьте наличие файлов <code>GEO.kml</code> и <code>RoadCity.kml</code> рядом с
+            <code>server.py</code>, затем примените настройки, чтобы перегенерировать сетку (см. README).
+          </div>
+        </div>
 
         <h2>Настройки расчёта</h2>
         <label for="grid-select">Размер сетки</label>
@@ -376,6 +402,11 @@
       const centerSummary = document.getElementById("center-summary");
 
       const tractorColors = {};
+      const gridErrorBanner = document.getElementById("grid-error-banner");
+      const gridErrorText = document.getElementById("grid-error-text");
+      let kmlReady = false;
+      let isBuilding = false;
+      let gridErrorMessage = "";
       rebuildTractorControls(tractorList);
       applySettingsSummary();
       updateGridIndicators();
@@ -383,11 +414,14 @@
       const initialGridError = (document.body.dataset.gridError || "").trim();
       let currentGridCells = Number(settingsState.grid_cells) || 0;
       let geoLayer = null;
+      setGridError(initialGridError, { silent: true });
 
       socket.on("assignments", (data) => {
         Object.keys(assignments).forEach((key) => delete assignments[key]);
         Object.assign(assignments, data || {});
         recolorAll();
+        kmlReady = false;
+        updateActionButtons();
       });
 
       socket.on("assign_sector", ({ sector_id, tractor_id }) => {
@@ -398,26 +432,31 @@
           delete assignments[sector_id];
         }
         recolorSector(sector_id);
+        kmlReady = false;
+        updateActionButtons();
       });
 
       socket.on("progress", ({ message }) => {
         appendLog(message);
       });
 
-      socket.on("build_done", ({ success }) => {
-        buildBtn.disabled = false;
-        if (success) {
-          downloadBtn.disabled = false;
-          downloadBtn.classList.remove("secondary");
-          downloadBtn.classList.add("primary");
-        } else {
-          downloadBtn.disabled = true;
-          downloadBtn.classList.remove("primary");
-          downloadBtn.classList.add("secondary");
-        }
+      socket.on("build_status", ({ running }) => {
+        isBuilding = Boolean(running);
+        updateActionButtons();
       });
 
-      socket.on("settings", ({ settings, tractors }) => {
+      socket.on("grid_error", ({ message }) => {
+        kmlReady = false;
+        setGridError(message);
+      });
+
+      socket.on("build_done", ({ success }) => {
+        isBuilding = false;
+        kmlReady = Boolean(success);
+        updateActionButtons();
+      });
+
+      socket.on("settings", ({ settings, tractors, grid_error }) => {
         if (settings && typeof settings === "object") {
           Object.assign(settingsState, settings);
           normaliseSettings(settingsState);
@@ -431,9 +470,13 @@
           rebuildTractorControls(tractorList);
           recolorAll();
         }
-        downloadBtn.disabled = true;
-        downloadBtn.classList.remove("primary");
-        downloadBtn.classList.add("secondary");
+        if (typeof grid_error !== "undefined") {
+          setGridError(grid_error);
+        } else {
+          setGridError(gridErrorMessage, { silent: true });
+        }
+        kmlReady = false;
+        updateActionButtons();
         loadGeojson(true);
       });
 
@@ -495,10 +538,44 @@
         }
       }
 
+      function updateActionButtons() {
+        const disableBuild = isBuilding || Boolean(gridErrorMessage);
+        buildBtn.disabled = disableBuild;
+        const canDownload = kmlReady && !gridErrorMessage && !isBuilding;
+        downloadBtn.disabled = !canDownload;
+        downloadBtn.classList.toggle("primary", canDownload);
+        downloadBtn.classList.toggle("secondary", !canDownload);
+      }
+
+      function setGridError(message, options = {}) {
+        const trimmed = (message || "").toString().trim();
+        const changed = gridErrorMessage !== trimmed;
+        gridErrorMessage = trimmed;
+        if (gridErrorBanner) {
+          if (trimmed) {
+            gridErrorBanner.style.display = "block";
+            if (gridErrorText) gridErrorText.textContent = trimmed;
+          } else {
+            gridErrorBanner.style.display = "none";
+            if (gridErrorText) gridErrorText.textContent = "";
+          }
+        }
+        updateActionButtons();
+        if (changed && !options.silent) {
+          if (trimmed) {
+            appendLog(`Ошибка сетки: ${trimmed}`);
+          } else {
+            appendLog("Сетка готова к работе.");
+          }
+        }
+      }
+
       function loadGeojson(showLog = false) {
         if (showLog) {
           appendLog(`Загружаю сетку (${settingsState.grid_cells || "?"} клеток)...`);
         }
+        kmlReady = false;
+        updateActionButtons();
         if (geoLayer) {
           map.removeLayer(geoLayer);
           geoLayer = null;
@@ -525,9 +602,19 @@
                 sectorLayers.set(sectorId, layer);
                 layer.on("click", () => {
                   const tractorId = tractorSelect.value;
-                  assignments[sectorId] = tractorId;
+                  if (!tractorId) {
+                    return;
+                  }
+                  if (assignments[sectorId] === tractorId) {
+                    delete assignments[sectorId];
+                    socket.emit("assign_sector", { sector_id: sectorId, tractor_id: null });
+                  } else {
+                    assignments[sectorId] = tractorId;
+                    socket.emit("assign_sector", { sector_id: sectorId, tractor_id: tractorId });
+                  }
+                  kmlReady = false;
+                  updateActionButtons();
                   recolorSector(sectorId);
-                  socket.emit("assign_sector", { sector_id: sectorId, tractor_id: tractorId });
                 });
                 recolorSector(sectorId);
               },
@@ -553,6 +640,8 @@
 
       clearBtn.addEventListener("click", () => {
         const tractorId = tractorSelect.value;
+        kmlReady = false;
+        updateActionButtons();
         Object.entries(assignments).forEach(([sectorId, assignedTo]) => {
           if (assignedTo === tractorId) {
             delete assignments[sectorId];
@@ -563,6 +652,8 @@
       });
 
       resetBtn.addEventListener("click", () => {
+        kmlReady = false;
+        updateActionButtons();
         Object.keys(assignments).forEach((key) => delete assignments[key]);
         recolorAll();
         socket.emit("assignments_reset", {});
@@ -575,6 +666,8 @@
             return;
           }
           appendLog(`Запрашиваю сетку на ${selected} клеток...`);
+          kmlReady = false;
+          updateActionButtons();
           submitSettings({ grid_cells: selected });
         });
       }
@@ -590,16 +683,18 @@
           base_lon: Number(baseLonInput.value),
           center_lat: Number(centerLatInput.value),
           center_lon: Number(centerLonInput.value),
+          grid_cells: gridSelect ? Number(gridSelect.value) : settingsState.grid_cells,
         };
         appendLog("Отправляю обновлённые параметры...");
+        kmlReady = false;
+        updateActionButtons();
         submitSettings(payload);
       });
 
       buildBtn.addEventListener("click", () => {
-        buildBtn.disabled = true;
-        downloadBtn.disabled = true;
-        downloadBtn.classList.remove("primary");
-        downloadBtn.classList.add("secondary");
+        isBuilding = true;
+        kmlReady = false;
+        updateActionButtons();
         appendLog("Запускаю построение маршрутов...");
         fetch("/run", {
           method: "POST",
@@ -615,11 +710,18 @@
           })
           .catch((error) => {
             appendLog(`Ошибка запуска: ${error.message}`);
-            buildBtn.disabled = false;
+            isBuilding = false;
+            if (error?.message && error.message.toLowerCase().includes("сетка")) {
+              setGridError(error.message);
+            }
+            updateActionButtons();
           });
       });
 
       downloadBtn.addEventListener("click", () => {
+        if (downloadBtn.disabled) {
+          return;
+        }
         window.location.href = "/download";
       });
 
@@ -652,9 +754,11 @@
               Object.keys(assignments).forEach((key) => delete assignments[key]);
               recolorAll();
             }
-            downloadBtn.disabled = true;
-            downloadBtn.classList.remove("primary");
-            downloadBtn.classList.add("secondary");
+            if (Object.prototype.hasOwnProperty.call(data || {}, "grid_error")) {
+              setGridError(data.grid_error);
+            }
+            kmlReady = false;
+            updateActionButtons();
             loadGeojson(true);
           })
           .catch((error) => {
@@ -662,6 +766,10 @@
             if (gridSelect) {
               gridSelect.value = String(settingsState.grid_cells || gridSelect.value);
             }
+            if (error?.message && error.message.toLowerCase().includes("сетка")) {
+              setGridError(error.message);
+            }
+            updateActionButtons();
           });
       }
 
