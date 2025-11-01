@@ -1,0 +1,17 @@
+{
+  "grid_cells": 64,
+  "n_units": 18,
+  "target_km": 30000,
+  "travel_mode": "driving",
+  "max_waypoints": 23,
+  "base_lat": 54.920031,
+  "base_lon": 37.40809,
+  "center_lat": 54.920031,
+  "center_lon": 37.40809,
+  "use_base_as_start": true,
+  "request_pause": 0.35,
+  "sample_every_m": 150.0,
+  "street_source": "google",
+  "advanced": false,
+  "mode": "grid"
+}

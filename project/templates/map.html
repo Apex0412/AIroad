@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <title>Диспетчеризация тракторов</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+  </head>
+  <body>
+    <div id="container">
+      <aside id="sidebar">
+        {% if grid_error %}
+        <div class="alert">⚠️ {{ grid_error }}</div>
+        {% endif %}
+        <div class="badge">Google API: {{ '✅' if has_google_key else '⚠️' }}</div>
+        <div class="badge">Yandex API: {{ '✅' if has_yandex_key else '⚠️' }}</div>
+        <label for="tractor-select">Трактор</label>
+        <select id="tractor-select"></select>
+        <div class="toggle-group">
+          <label><input type="radio" name="mode" value="grid" {{ 'checked' if settings.mode == 'grid' else '' }}>Сетка</label>
+          <label><input type="radio" name="mode" value="road" {{ 'checked' if settings.mode == 'road' else '' }}>Дороги</label>
+        </div>
+        <label><input type="checkbox" name="advanced" {{ 'checked' if settings.advanced else '' }}> Advanced Optimization</label>
+        <div class="toggle-group">
+          <label><input type="radio" name="street-source" value="google" {{ 'checked' if settings.street_source == 'google' else '' }}>Google</label>
+          <label><input type="radio" name="street-source" value="yandex" {{ 'checked' if settings.street_source == 'yandex' else '' }}>Yandex</label>
+        </div>
+        <label for="grid-cells">Количество клеток</label>
+        <input id="grid-cells" type="number" min="16" max="400" value="{{ settings.grid_cells }}">
+        <label for="n-units">Количество тракторов</label>
+        <input id="n-units" type="number" min="1" max="64" value="{{ settings.n_units }}">
+        <label for="target-km">Целевая длина маршрута (м)</label>
+        <input id="target-km" type="number" min="1000" max="100000" step="500" value="{{ settings.target_km }}">
+        <label for="travel-mode">Travel mode</label>
+        <select id="travel-mode">
+          <option value="driving" {{ 'selected' if settings.travel_mode == 'driving' else '' }}>Driving</option>
+          <option value="walking" {{ 'selected' if settings.travel_mode == 'walking' else '' }}>Walking</option>
+          <option value="bicycling" {{ 'selected' if settings.travel_mode == 'bicycling' else '' }}>Bicycling</option>
+        </select>
+        <label for="max-waypoints">Максимум waypoint</label>
+        <input id="max-waypoints" type="number" min="5" max="25" value="{{ settings.max_waypoints }}">
+        <label><input type="checkbox" id="use-base-start" {{ 'checked' if settings.use_base_as_start else '' }}> Стартовать с базы</label>
+        <label for="base-lat">Base lat</label>
+        <input id="base-lat" type="number" step="0.000001" value="{{ settings.base_lat }}">
+        <label for="base-lon">Base lon</label>
+        <input id="base-lon" type="number" step="0.000001" value="{{ settings.base_lon }}">
+        <label for="center-lat">Center lat</label>
+        <input id="center-lat" type="number" step="0.000001" value="{{ settings.center_lat }}">
+        <label for="center-lon">Center lon</label>
+        <input id="center-lon" type="number" step="0.000001" value="{{ settings.center_lon }}">
+        <button class="secondary" id="apply-settings">Сохранить сетку</button>
+        <button class="secondary" id="clear-selected">Очистить у выбранного</button>
+        <button class="secondary" id="reset-all">Сбросить всё</button>
+        <button class="secondary" id="auto-assign">🎲 Автораспределение</button>
+        <button class="primary" id="save-build">💾 Сохранить и построить</button>
+        <button class="secondary" id="download-kml">⬇️ Скачать KML</button>
+        <div id="log"></div>
+      </aside>
+      <main id="map"></main>
+    </div>
+    <script>
+      const initialSettings = {{ settings|tojson }};
+      const gridError = {{ grid_error|tojson }};
+      const tractorColors = {{ tractor_colors|tojson }};
+      const hasGoogleKey = {{ has_google_key|tojson }};
+      const hasYandexKey = {{ has_yandex_key|tojson }};
+    </script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <script src="https://unpkg.com/leaflet-plugins/layer/vector/KML.js"></script>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+  </body>
+</html>
