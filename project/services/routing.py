@@ -5,9 +5,18 @@ import json
 import os
 import subprocess
 import sys
+import time
+from collections import defaultdict
 from typing import Dict
 
-from config import APP_ROOT, GEO_PATH, ROADS_ASSIGN_JSON, ROADS_COLORED_KML, ROADS_PATH, ROUTES_KML
+from config import (
+    APP_ROOT,
+    GEO_PATH,
+    ROADS_ASSIGN_JSON,
+    ROADS_COLORED_KML,
+    ROADS_PATH,
+    ROUTES_KML,
+)
 from shapely.geometry import Point
 
 from .kml_io import read_roads_kml, read_zone_kml
@@ -16,10 +25,10 @@ from utils.progress import emit_progress
 from .geo import is_valid_coord
 
 
-def build_routes(settings: Dict[str, object], socketio) -> None:
+def build_routes(settings: Dict[str, object], socketio) -> Dict[str, object]:
     if not ROADS_ASSIGN_JSON.exists():
         emit_progress("route", "⚠️ Нет назначений дорог", 0)
-        return
+        return {"exit_code": 0, "lengths": {}, "segments": {}}
 
     args = [
         sys.executable,
@@ -102,6 +111,10 @@ def build_routes(settings: Dict[str, object], socketio) -> None:
         "экспорт": ("💾 Экспортирую KML", 90),
     }
 
+    segment_counts: dict[str, int] = defaultdict(int)
+    route_lengths: dict[str, float] = {}
+    build_started = time.time()
+
     for raw in iter(process.stdout.readline, ""):
         line = raw.strip()
         if not line:
@@ -116,9 +129,24 @@ def build_routes(settings: Dict[str, object], socketio) -> None:
                 continue
             emit_progress("route", f"Маршрут {tractor_id}: {len(coords)} точек", None)
             socketio.emit("route_step", {"tractor_id": tractor_id, "polyline": coords})
+            if tractor_id:
+                segment_counts[tractor_id] += max(len(coords) - 1, 0)
         elif line.startswith("[ROUTE_DONE]"):
-            emit_progress("route", line.split("]", 1)[1].strip(), 95)
-            socketio.emit("tractor_done", {})
+            message = line.split("]", 1)[1].strip()
+            emit_progress("route", message, 95)
+            tokens = {
+                part.split("=", 1)[0].strip(): part.split("=", 1)[1].strip()
+                for part in message.replace("\u202f", " ").split()
+                if "=" in part
+            }
+            tractor_id = tokens.get("tractor")
+            length_val = tokens.get("length")
+            length = float(length_val) if length_val is not None else None
+            if tractor_id and length is not None:
+                route_lengths[tractor_id] = length
+                socketio.emit("tractor_done", {"tractor": tractor_id, "length": length})
+            else:
+                socketio.emit("tractor_done", {})
         else:
             lowered = line.lower()
             matched = False
@@ -131,9 +159,15 @@ def build_routes(settings: Dict[str, object], socketio) -> None:
                 emit_progress("route", line, None)
 
     code = process.wait()
+    duration = time.time() - build_started
+
     if code == 0:
         emit_progress("route", "✅ Маршруты построены", 100)
-        if ROUTES_KML.exists():
-            socketio.emit("routes_ready", {})
     else:
         emit_progress("route", f"❌ Ошибка построения (код {code})", 100)
+    return {
+        "exit_code": code,
+        "lengths": route_lengths,
+        "segments": dict(segment_counts),
+        "duration_sec": duration,
+    }

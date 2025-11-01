@@ -2,6 +2,10 @@ from pathlib import Path
 
 import sys
 
+import pytest
+
+pytest.importorskip("shapely")
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from services.kml_io import read_roads_kml, read_zone_kml

@@ -29,6 +29,7 @@ ASSIGNMENTS_JSON = DATA_DIR / "assignments.json"
 ROADS_ASSIGN_JSON = DATA_DIR / "roads_assignment.json"
 ROUTES_KML = DATA_DIR / "routes_grid.kml"
 ROADS_COLORED_KML = DATA_DIR / "roads_colored.kml"
+STATE_JSON = DATA_DIR / "state.json"
 STREETS_CACHE = CACHE_DIR / "streets_cache.json"
 SETTINGS_PATH = APP_ROOT / "app_settings.json"
 

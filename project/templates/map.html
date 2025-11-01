@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
   </head>
-  <body class="theme-light">
+  <body class="theme-{{ 'dark' if settings.theme == 'dark' else 'light' }}">
     <button id="sidebar-toggle" class="sidebar-toggle" aria-label="Открыть панель">
       ☰
     </button>
@@ -87,7 +87,7 @@
             <button class="btn secondary" id="check-base">🔍 Проверить базу</button>
             <button class="btn secondary" id="clear-routes">🧹 Очистить маршруты</button>
             <button class="btn primary" id="save-build">🧭 Построить маршруты</button>
-            <button class="btn success" id="download-kml" type="button">⬇️ Скачать KML</button>
+            <button class="btn success" id="download-kml" type="button" {{ '' if routes_ready else 'disabled' }}>⬇️ Скачать KML</button>
             <button class="btn secondary" id="clear-log">🧾 Очистить лог</button>
           </div>
         </section>
@@ -110,6 +110,19 @@
       <div class="progress-bar"><div class="progress-fill"></div></div>
       <span id="progress-text">Готово</span>
     </div>
+    <div id="route-stats" class="stats-card{{ '' if route_stats else ' hidden' }}">
+      <header>
+        <span class="stats-title">🧭 Статистика маршрутов</span>
+        <small id="stats-updated">{{ route_stats.updated_at if route_stats else '' }}</small>
+      </header>
+      <div class="stats-grid">
+        <div><span data-stat="routes">{{ route_stats.routes if route_stats else 0 }}</span><small>Маршрутов</small></div>
+        <div><span data-stat="total">{{ '%.1f'|format(route_stats.total_km) if route_stats else '0.0' }}</span><small>Общая длина, км</small></div>
+        <div><span data-stat="avg">{{ '%.1f'|format(route_stats.average_km) if route_stats else '0.0' }}</span><small>Средняя длина</small></div>
+        <div><span data-stat="cells">{{ route_stats.cells if route_stats else 0 }}</span><small>Клеток</small></div>
+        <div><span data-stat="duration">{{ '%.1f'|format(route_stats.duration_sec) if route_stats else '0.0' }}</span><small>Время, с</small></div>
+      </div>
+    </div>
     <div id="action-monitor">
       <header>
         <div class="title">Монитор действий</div>
@@ -127,6 +140,8 @@
       const tractorColors = {{ tractor_colors|tojson }};
       const hasGoogleKey = {{ has_google_key|tojson }};
       const hasYandexKey = {{ has_yandex_key|tojson }};
+      const initialRouteStats = {{ route_stats|tojson }};
+      const initialRoutesReady = {{ routes_ready|tojson }};
     </script>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>

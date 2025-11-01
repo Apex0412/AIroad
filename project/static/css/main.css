@@ -169,6 +169,96 @@ body.theme-dark {
   transition: width 0.3s ease;
 }
 
+.stats-card {
+  position: fixed;
+  top: 90px;
+  right: 24px;
+  width: 320px;
+  max-width: calc(100vw - 40px);
+  padding: 16px 18px;
+  background: rgba(13, 21, 40, 0.9);
+  color: #e2e8f0;
+  border-radius: 18px;
+  box-shadow: 0 10px 32px rgba(15, 23, 42, 0.4);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  backdrop-filter: blur(6px);
+  z-index: 9990;
+}
+
+body.theme-light .stats-card {
+  background: rgba(255, 255, 255, 0.92);
+  color: var(--text-light);
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.18);
+}
+
+.stats-card header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-weight: 600;
+}
+
+.stats-card header small {
+  font-weight: 400;
+  font-size: 0.76rem;
+  color: #94a3b8;
+}
+
+body.theme-light .stats-card header small {
+  color: #475569;
+}
+
+.stats-title {
+  font-size: 0.95rem;
+  letter-spacing: 0.03em;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.stats-grid div {
+  background: rgba(15, 23, 42, 0.35);
+  border-radius: 14px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+body.theme-light .stats-grid div {
+  background: rgba(148, 163, 184, 0.18);
+}
+
+.stats-grid span[data-stat] {
+  font-size: 1.2rem;
+  font-weight: 600;
+}
+
+.stats-grid small {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #cbd5f5;
+}
+
+body.theme-light .stats-grid small {
+  color: #475569;
+}
+
+@media (max-width: 768px) {
+  .stats-card {
+    width: auto;
+    left: 16px;
+    right: 16px;
+    top: 76px;
+  }
+}
+
 .app-shell {
   display: flex;
   min-height: 100vh;
@@ -422,6 +512,19 @@ body.theme-dark .sidebar {
 .btn.success {
   background: var(--success);
   color: #fff;
+}
+
+.btn.ready {
+  background: rgba(40, 167, 69, 0.12);
+  color: var(--success);
+  border: 1px solid rgba(40, 167, 69, 0.55);
+  box-shadow: 0 6px 16px rgba(40, 167, 69, 0.2);
+}
+
+body.theme-dark .btn.ready {
+  background: rgba(74, 222, 128, 0.15);
+  color: #86efac;
+  border-color: rgba(74, 222, 128, 0.45);
 }
 
 .btn:disabled {

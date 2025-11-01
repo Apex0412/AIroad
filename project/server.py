@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from datetime import datetime
 from typing import Dict, List
 
@@ -22,6 +23,7 @@ from config import (
     ROADS_COLORED_KML,
     ROADS_PATH,
     ROUTES_KML,
+    STATE_JSON,
     env_google_key,
     env_yandex_key,
     load_settings as config_load_settings,
@@ -30,7 +32,14 @@ from config import (
 from route_builder import TRACTOR_COLORS
 from route_builder.optimizer import Tractor
 from services import state as state_store
-from services.state import append_monitor_entry, reset_routes, set_assignments, set_grid, set_roads
+from services.state import (
+    append_monitor_entry,
+    reset_routes,
+    set_assignments,
+    set_grid,
+    set_roads,
+    set_route_stats,
+)
 from services.assign import (
     auto_assign_cells,
     auto_assign_roads,
@@ -93,6 +102,108 @@ _roads_cache: dict | None = None
 _grid_build_lock = threading.Lock()
 _auto_assign_lock = threading.Lock()
 _roads_lock = threading.Lock()
+_build_start_time: float | None = None
+
+
+def _collect_state_snapshot() -> Dict[str, object]:
+    settings_copy = dict(_current_settings)
+    assignments_copy = dict(_assignments)
+    grid_meta = {
+        "cells": len(STATE.grid.get("features", [])) if STATE.grid else 0,
+        "exists": GRID_GEOJSON.exists(),
+        "error": STATE.grid_error,
+    }
+    routes_meta = {
+        "ready": STATE.routes_ready,
+        "error": STATE.routes_error,
+        "stats": STATE.route_stats,
+    }
+    snapshot = {
+        "settings": settings_copy,
+        "assignments": assignments_copy,
+        "assignments_summary": STATE.assignments_summary,
+        "grid": grid_meta,
+        "routes": routes_meta,
+        "theme": settings_copy.get("theme", "light"),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    return snapshot
+
+
+def _persist_state() -> None:
+    try:
+        snapshot = _collect_state_snapshot()
+        STATE_JSON.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        app.logger.warning("Не удалось сохранить state.json: %s", exc)
+
+
+def _compose_route_stats(summary: Dict[str, object], duration: float) -> Dict[str, object]:
+    lengths_raw = summary.get("lengths") or {}
+    segments_raw = summary.get("segments") or {}
+    lengths = {str(k): float(v) for k, v in lengths_raw.items()}
+    segments = {str(k): int(v) for k, v in segments_raw.items()}
+    total_km = sum(lengths.values())
+    route_count = len(lengths)
+    stats = {
+        "routes": route_count,
+        "total_km": round(total_km, 3),
+        "average_km": round(total_km / route_count, 3) if route_count else 0.0,
+        "cells": len(_assignments),
+        "lengths": lengths,
+        "segments": segments,
+        "duration_sec": round(duration, 2),
+        "provider": _current_settings.get("routing_provider"),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    return stats
+
+
+def _load_state_file() -> None:
+    global _assignments
+    if not STATE_JSON.exists():
+        return
+    try:
+        payload = json.loads(STATE_JSON.read_text(encoding="utf-8"))
+    except Exception as exc:
+        _emit_log(f"[{_timestamp()}] [STATE] ⚠️ Не удалось прочитать state.json: {exc}")
+        return
+
+    settings_payload = payload.get("settings")
+    if isinstance(settings_payload, dict):
+        _current_settings.update(settings_payload)
+
+    theme_value = payload.get("theme")
+    if isinstance(theme_value, str):
+        _current_settings["theme"] = theme_value
+
+    assignments_payload = payload.get("assignments")
+    if isinstance(assignments_payload, dict):
+        _assignments = {str(k): str(v) for k, v in assignments_payload.items()}
+        set_assignments(_assignments, payload.get("assignments_summary"))
+        if _assignments:
+            ASSIGNMENTS_JSON.write_text(
+                json.dumps(_assignments, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+    routes_payload = payload.get("routes") or {}
+    STATE.routes_ready = bool(routes_payload.get("ready"))
+    STATE.routes_error = routes_payload.get("error")
+    stats_payload = routes_payload.get("stats")
+    if stats_payload:
+        set_route_stats(stats_payload)
+
+    STATE.settings = dict(_current_settings)
+
+    tractors = int(_current_settings.get("n_units", 0))
+    grid_cells = payload.get("grid", {}).get("cells") or _current_settings.get("grid_cells")
+    _emit_log(
+        f"[{_timestamp()}] [STATE] Восстановлено предыдущее состояние — {tractors} тракторов, {grid_cells} клеток",
+    )
 
 
 def _emit_log(message: str) -> None:
@@ -153,12 +264,15 @@ def load_settings() -> Dict[str, object]:
         "mode": "grid" if os.getenv("USE_GRID_BY_DEFAULT", "true").lower() == "true" else "road",
         "routing_provider": routing_provider_env,
         "validate_coord_order": os.getenv("VALIDATE_COORD_ORDER", "true").lower() == "true",
+        "theme": os.getenv("UI_THEME", "light"),
     }
     return config_load_settings(defaults)
 
 
 def save_settings(settings: Dict[str, object]) -> None:
     config_save_settings(settings)
+    STATE.settings = dict(settings)
+    _persist_state()
 
 
 def tractors_for_settings(settings: Dict[str, object]) -> List[Tractor]:
@@ -240,6 +354,7 @@ def _grid_build_worker(grid_cells: int) -> None:
         socketio.emit("grid_updated", data)
         socketio.emit("map:update", {"grid": data})
         emit_progress("grid", "✅ Сетка успешно построена", 100)
+        _persist_state()
     except Exception as exc:  # pragma: no cover - defensive
         _grid_error = str(exc)
         set_grid(None, error=_grid_error)
@@ -302,6 +417,7 @@ def _ensure_roads_geojson():
     _roads_cache = {"type": "FeatureCollection", "features": features}
     set_roads(_roads_cache, error=None)
     socketio.emit("map:update", {"roads": _roads_cache})
+    _persist_state()
     return _roads_cache
 
 
@@ -315,6 +431,8 @@ def index():
         has_google_key=bool(env_google_key()),
         has_yandex_key=bool(env_yandex_key()),
         tractor_colors=TRACTOR_COLORS,
+        routes_ready=STATE.routes_ready and ROUTES_KML.exists(),
+        route_stats=STATE.route_stats,
     )
 
 
@@ -359,6 +477,7 @@ def api_state():
         "assignments_summary": STATE.assignments_summary,
         "routes_ready": STATE.routes_ready,
         "routes_error": STATE.routes_error,
+        "route_stats": STATE.route_stats,
     }
     return jsonify(state_payload)
 
@@ -403,6 +522,21 @@ def update_settings():
     if _grid_error:
         return jsonify({"status": "error", "error": _grid_error}), 400
     return jsonify({"success": True, "status": "started", "settings": _current_settings})
+
+
+@app.post("/theme")
+def update_theme():
+    try:
+        payload = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "Некорректный JSON"}), 400
+    theme = str(payload.get("theme", "")).strip().lower()
+    if theme not in {"light", "dark"}:
+        return jsonify({"error": "Неизвестная тема"}), 400
+    _current_settings["theme"] = theme
+    save_settings(_current_settings)
+    socketio.emit("settings", {"settings": _current_settings})
+    return jsonify({"success": True, "theme": theme})
 
 
 @app.post("/auto_assign")
@@ -488,6 +622,7 @@ def _auto_assign_task(
                     f"{item['area_km2']:.2f} км², дорог {item['roads_m']:.0f} м"
                 )
             emit_progress("assign", "✅ Автораспределение завершено", 100)
+            _persist_state()
         else:
             emit_progress("assign", "Запускаю автораспределение дорог", 10)
             global _roads_cache
@@ -530,6 +665,7 @@ def _auto_assign_task(
                 f"[{_timestamp()}] [ASSIGN] Автораспределение дорог завершено. {sum(stats.values()):.0f} м покрыто"
             )
             emit_progress("assign", "✅ Автораспределение дорог завершено", 100)
+            _persist_state()
     except Exception as exc:  # pragma: no cover - defensive
         emit_progress("assign", f"⚠️ Ошибка автораспределения: {exc}", 100)
 
@@ -596,7 +732,9 @@ def clear_routes_endpoint():
         except OSError:
             pass
     reset_routes()
+    set_route_stats(None)
     socketio.emit("clear_routes", {})
+    _persist_state()
     return jsonify({"success": True})
 
 
@@ -617,22 +755,40 @@ def _background_build() -> None:
         return
     socketio.emit("build_status", {"running": True})
     reset_routes()
+    set_route_stats(None)
     try:
         emit_progress("route", "🚀 Запуск маршрутизации…", 5)
-        build_routes(_current_settings, socketio)
-        STATE.routes_ready = True
-        STATE.routes_error = None
-        socketio.emit("build_done", {"success": True})
+        started = time.time()
+        summary = build_routes(_current_settings, socketio)
+        exit_code = summary.get("exit_code", 1)
+        if exit_code == 0:
+            duration = summary.get("duration_sec") or (time.time() - started)
+            stats_payload = _compose_route_stats(summary, duration)
+            STATE.routes_ready = True
+            STATE.routes_error = None
+            set_route_stats(stats_payload)
+            socketio.emit("route_stats", stats_payload)
+            if ROUTES_KML.exists():
+                socketio.emit("routes_ready", stats_payload)
+            socketio.emit("build_done", {"success": True, "stats": stats_payload})
+        else:
+            STATE.routes_ready = False
+            error_message = f"Ошибка построения (код {exit_code})"
+            STATE.routes_error = error_message
+            set_route_stats(None)
+            socketio.emit("build_done", {"success": False, "error": error_message})
     except Exception as exc:
         emit_progress("route", f"❌ Ошибка запуска: {exc}", 100)
         STATE.routes_ready = False
         STATE.routes_error = str(exc)
-        socketio.emit("build_done", {"success": False})
+        set_route_stats(None)
+        socketio.emit("build_done", {"success": False, "error": str(exc)})
     finally:
         global _build_thread
         _build_thread = None
         _build_lock.release()
         socketio.emit("build_status", {"running": False})
+        _persist_state()
 
 
 @socketio.on("connect")
@@ -651,8 +807,15 @@ def on_connect():
                 data = json.loads(GRID_GEOJSON.read_text(encoding="utf-8"))
                 socketio.emit("grid_ready", {"cells": len(data.get("features", []))})
                 socketio.emit("grid_updated", data)
+                socketio.emit("map:update", {"grid": data})
             except Exception:
                 pass
+    if STATE.roads:
+        socketio.emit("map:update", {"roads": STATE.roads})
+    if STATE.route_stats:
+        socketio.emit("route_stats", STATE.route_stats)
+    if STATE.routes_ready and ROUTES_KML.exists():
+        socketio.emit("routes_ready", STATE.route_stats or {})
 
 
 @socketio.on("assign_sector")
@@ -665,6 +828,7 @@ def on_assign_sector(payload):
     ASSIGNMENTS_JSON.write_text(json.dumps(_assignments, ensure_ascii=False, indent=2), encoding="utf-8")
     set_assignments(_assignments)
     socketio.emit("assignments_updated", {"assignments": _assignments})
+    _persist_state()
 
 
 @socketio.on("assignments_reset")
@@ -679,6 +843,7 @@ def on_assignments_reset(payload):
     ASSIGNMENTS_JSON.write_text(json.dumps(_assignments, ensure_ascii=False, indent=2), encoding="utf-8")
     set_assignments(_assignments)
     socketio.emit("assignments_updated", {"assignments": _assignments})
+    _persist_state()
 
 
 @app.errorhandler(Exception)
@@ -689,13 +854,16 @@ def handle_error(exc):
 def bootstrap():
     global _current_settings, _assignments, _roads_cache
     _current_settings = load_settings()
+    STATE.settings = dict(_current_settings)
     _assignments = load_assignments()
     set_assignments(_assignments)
     _roads_cache = None
+    _load_state_file()
     _emit_log(f"[{_timestamp()}] [LOAD] Загружаю GEO.kml…")
     ensure_grid_exists(int(_current_settings.get("grid_cells", 64)))
     _emit_log(f"[{_timestamp()}] [LOAD] Загружаю RoadCity.kml…")
     _ensure_roads_geojson()
+    _persist_state()
 
 
 if __name__ == "__main__":

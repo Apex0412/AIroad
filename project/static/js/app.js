@@ -8,7 +8,10 @@ const state = {
   streetSource: initialSettings.street_source || 'google',
   provider: initialSettings.routing_provider || 'google',
   building: false,
-  theme: 'light',
+  theme: (initialSettings.theme || 'light').toLowerCase() === 'dark' ? 'dark' : 'light',
+  routeStats: initialRouteStats || null,
+  routesReady: Boolean(initialRoutesReady),
+  buildStartedAt: null,
 };
 
 const logHistory = [];
@@ -48,6 +51,18 @@ const monitorProgress = monitorBox ? monitorBox.querySelector('.progress-inner')
 const monitorLog = document.getElementById('monitor-log');
 const downloadLogBtn = document.getElementById('download-log');
 const clearMonitorBtn = document.getElementById('clear-monitor');
+const downloadButton = document.getElementById('download-kml');
+const statsCard = document.getElementById('route-stats');
+const statsUpdated = document.getElementById('stats-updated');
+const statsFields = statsCard
+  ? {
+      routes: statsCard.querySelector('[data-stat="routes"]'),
+      total: statsCard.querySelector('[data-stat="total"]'),
+      avg: statsCard.querySelector('[data-stat="avg"]'),
+      cells: statsCard.querySelector('[data-stat="cells"]'),
+      duration: statsCard.querySelector('[data-stat="duration"]'),
+    }
+  : null;
 
 const sectorLayers = new Map();
 const routeLayers = new Map();
@@ -71,12 +86,9 @@ const stageIcons = {
   LOG: '📝',
 };
 
-const themePreference = localStorage.getItem('dispatcher-theme');
-if (themePreference === 'dark') {
-  document.body.classList.add('theme-dark');
-  state.theme = 'dark';
-  themeToggle.textContent = '☀️';
-}
+const storedTheme = localStorage.getItem('dispatcher-theme');
+const initialTheme = storedTheme || state.theme;
+applyTheme(initialTheme, false);
 
 function toggleSidebar(force) {
   if (window.innerWidth >= 992) return;
@@ -86,11 +98,19 @@ function toggleSidebar(force) {
 
 sidebarToggle.addEventListener('click', () => toggleSidebar());
 
-function applyTheme(next) {
-  state.theme = next;
-  document.body.classList.toggle('theme-dark', next === 'dark');
-  themeToggle.textContent = next === 'dark' ? '☀️' : '🌙';
-  localStorage.setItem('dispatcher-theme', next);
+function applyTheme(next, notifyServer = true) {
+  const themeValue = next === 'dark' ? 'dark' : 'light';
+  state.theme = themeValue;
+  document.body.classList.toggle('theme-dark', themeValue === 'dark');
+  themeToggle.textContent = themeValue === 'dark' ? '☀️' : '🌙';
+  localStorage.setItem('dispatcher-theme', themeValue);
+  if (notifyServer) {
+    fetch('/theme', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ theme: themeValue }),
+    }).catch(() => {});
+  }
 }
 
 themeToggle.addEventListener('click', () => {
@@ -155,6 +175,67 @@ function setMapSpinner(active) {
     mapSpinner.hidden = true;
     mapSpinner.classList.remove('active');
   }
+}
+
+function updateDownloadButton() {
+  if (!downloadButton) return;
+  const enabled = Boolean(state.routesReady);
+  downloadButton.disabled = !enabled;
+  downloadButton.classList.toggle('ready', enabled);
+}
+
+function formatNumber(value, digits = 1) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num.toFixed(digits) : '0.0';
+}
+
+function applyRouteLengths(lengthMap = {}) {
+  const map = lengthMap || {};
+  state.tractors.forEach((tractor) => {
+    const val = Number(map[tractor.id]);
+    if (Number.isFinite(val)) {
+      tractor.length = val;
+    } else if (!state.routesReady) {
+      tractor.length = 0;
+    }
+  });
+  renderLegend();
+}
+
+function updateStatsCard(stats) {
+  if (!statsCard) return;
+  if (!stats || typeof stats !== 'object') {
+    state.routeStats = null;
+    if (statsCard) statsCard.classList.add('hidden');
+    if (statsFields) {
+      statsFields.routes.textContent = '0';
+      statsFields.total.textContent = '0.0';
+      statsFields.avg.textContent = '0.0';
+      statsFields.cells.textContent = '0';
+      statsFields.duration.textContent = '0.0';
+    }
+    if (statsUpdated) statsUpdated.textContent = '';
+    state.tractors.forEach((tractor) => {
+      tractor.length = 0;
+    });
+    renderLegend();
+    return;
+  }
+  state.routeStats = stats;
+  if (statsFields) {
+    statsFields.routes.textContent = String(stats.routes ?? 0);
+    statsFields.total.textContent = formatNumber(stats.total_km, 1);
+    statsFields.avg.textContent = formatNumber(stats.average_km, 1);
+    statsFields.cells.textContent = String(stats.cells ?? 0);
+    statsFields.duration.textContent = formatNumber(stats.duration_sec, 1);
+  }
+  if (statsUpdated) {
+    statsUpdated.textContent = stats.updated_at ? stats.updated_at.replace('T', ' ') : '';
+  }
+  statsCard.classList.remove('hidden');
+  applyRouteLengths(stats.lengths || {});
+  state.routesReady = true;
+  updateDownloadButton();
 }
 
 function updateGlobalProgress(stage, text, percent) {
@@ -327,12 +408,13 @@ if (checkBaseBtn) {
 function buildTractors() {
   state.tractors = [];
   const units = Number(initialSettings.n_units) || 0;
+  const lengthMap = (state.routeStats && state.routeStats.lengths) || {};
   for (let i = 0; i < units; i += 1) {
     state.tractors.push({
       id: `tractor_${String(i + 1).padStart(2, '0')}`,
       name: `Трактор ${String(i + 1).padStart(2, '0')}`,
       color: tractorColors[i % tractorColors.length],
-      length: 0,
+      length: Number(lengthMap[`tractor_${String(i + 1).padStart(2, '0')}`]) || 0,
     });
   }
   state.currentTractor = state.tractors[0]?.id || null;
@@ -344,6 +426,11 @@ function buildTractors() {
     tractorSelect.appendChild(option);
   });
   renderLegend();
+  if (state.routeStats) {
+    updateStatsCard(state.routeStats);
+  } else {
+    updateDownloadButton();
+  }
 }
 
 function renderLegend() {
@@ -568,6 +655,9 @@ function autoAssign() {
   setBusy(btn, true);
   btn.textContent = '⏳ Распределяю…';
   appendLog('[ASSIGN] Запускаю автораспределение…');
+  state.routesReady = false;
+  updateDownloadButton();
+  updateStatsCard(null);
   resetAssignments();
   fetch('/auto_assign', {
     method: 'POST',
@@ -598,6 +688,10 @@ function buildRoutes() {
   appendLog('🚀 Запуск построения маршрутов');
   setSpinner(true);
   disableDuringBuild(true);
+  state.routesReady = false;
+  state.buildStartedAt = Date.now();
+  updateDownloadButton();
+  updateStatsCard(null);
   fetch('/build_routes', { method: 'POST' })
     .then((res) => res.json())
     .then((data) => {
@@ -613,15 +707,24 @@ function buildRoutes() {
 function disableDuringBuild(flag) {
   const buttons = document.querySelectorAll('.btn');
   buttons.forEach((btn) => {
-    if (btn.id !== 'download-kml') btn.disabled = flag;
+    if (btn.id === 'download-kml') {
+      btn.disabled = flag || !state.routesReady;
+      btn.classList.toggle('ready', !btn.disabled);
+    } else {
+      btn.disabled = flag;
+    }
   });
 }
 
 function downloadKml() {
+  if (downloadButton && downloadButton.disabled) return;
   window.open('/routes_grid.kml', '_blank');
 }
 
 function clearRoutes() {
+  state.routesReady = false;
+  updateDownloadButton();
+  updateStatsCard(null);
   fetch('/clear_routes', { method: 'POST' })
     .then((res) => res.json())
     .then((data) => {
@@ -771,6 +874,9 @@ socket.on('settings', (payload) => {
   state.streetSource = initialSettings.street_source || state.streetSource;
   state.provider = initialSettings.routing_provider || state.provider;
   updateBaseMarker(Number(initialSettings.base_lat), Number(initialSettings.base_lon));
+  if (payload.settings && payload.settings.theme) {
+    applyTheme(payload.settings.theme, false);
+  }
   const modeInput = document.querySelector(`input[name="mode"][value="${state.mode}"]`);
   if (modeInput) modeInput.checked = true;
   if (advancedToggle) advancedToggle.checked = state.advanced;
@@ -794,10 +900,16 @@ socket.on('assignments_updated', (payload) => {
   Object.entries(payload.assignments).forEach(([sectorId, tractorId]) => applyAssignment(sectorId, tractorId));
   appendLog('[ASSIGN] Назначения обновлены');
   if (Array.isArray(payload.summary)) {
+    let totalCells = 0;
     payload.summary.forEach((item) => {
       const roads = Math.round(item.roads_m || 0);
       appendLog(`[ASSIGN] ${item.tractor}: ${item.cells} клеток, ${item.area_km2.toFixed(2)} км², дорог ${roads} м`);
+      totalCells += Number(item.cells || 0);
     });
+    if (state.routeStats && statsFields) {
+      state.routeStats.cells = totalCells;
+      statsFields.cells.textContent = String(totalCells);
+    }
   }
   const btn = document.getElementById('auto-assign');
   if (btn && btn.classList.contains('loading')) {
@@ -825,6 +937,10 @@ socket.on('roads_assignment', (data) => {
   }
 });
 
+socket.on('route_stats', (stats) => {
+  updateStatsCard(stats);
+});
+
 socket.on('route_step', (data) => {
   const { tractor_id: tractorId, polyline } = data;
   if (!routeLayers.has(tractorId)) {
@@ -841,10 +957,26 @@ socket.on('route_step', (data) => {
 socket.on('tractor_done', (info) => {
   appendLog('✅ Один из тракторов завершил маршрут');
   if (info && info.tractor && info.length) {
-    const tractor = getTractorById(info.tractor);
-    if (tractor) {
-      tractor.length = Number(info.length);
-      renderLegend();
+    const lengthValue = Number(info.length);
+    if (!Number.isFinite(lengthValue)) return;
+    if (state.routeStats) {
+      state.routeStats.lengths = state.routeStats.lengths || {};
+      state.routeStats.lengths[info.tractor] = lengthValue;
+      applyRouteLengths(state.routeStats.lengths);
+      if (statsFields) {
+        const total = Object.values(state.routeStats.lengths).reduce(
+          (acc, value) => acc + Number(value || 0),
+          0,
+        );
+        statsFields.total.textContent = formatNumber(total, 1);
+        statsFields.routes.textContent = String(Object.keys(state.routeStats.lengths).length);
+      }
+    } else {
+      const tractor = getTractorById(info.tractor);
+      if (tractor && Number.isFinite(lengthValue)) {
+        tractor.length = lengthValue;
+        renderLegend();
+      }
     }
   }
 });
@@ -856,11 +988,21 @@ socket.on('clear_routes', () => {
     map.removeLayer(kmlLayer);
     kmlLayer = null;
   }
+  state.routesReady = false;
+  state.routeStats = null;
+  updateDownloadButton();
+  updateStatsCard(null);
 });
 
-socket.on('routes_ready', () => {
+socket.on('routes_ready', (data) => {
   setSpinner(false);
   disableDuringBuild(false);
+  state.routesReady = true;
+  updateDownloadButton();
+  const statsData = data && typeof data === 'object' ? data.stats || data : null;
+  if (statsData && (statsData.routes || statsData.total_km || statsData.lengths)) {
+    updateStatsCard(statsData);
+  }
   fetch('/routes_grid.kml')
     .then((res) => res.text())
     .then((kmlText) => {
@@ -877,6 +1019,13 @@ socket.on('routes_ready', () => {
 socket.on('build_status', (payload) => {
   if (!payload) return;
   setSpinner(Boolean(payload.running));
+  if (payload.running) {
+    state.buildStartedAt = Date.now();
+  } else if (state.buildStartedAt && state.routeStats && statsFields) {
+    const elapsed = (Date.now() - state.buildStartedAt) / 1000;
+    state.routeStats.duration_sec = elapsed;
+    statsFields.duration.textContent = formatNumber(elapsed, 1);
+  }
   if (!payload.running) disableDuringBuild(false);
 });
 
@@ -886,8 +1035,17 @@ socket.on('build_done', (data) => {
   if (!data?.success) {
     appendLog('[ROUTE ERROR] Построение завершилось с ошибкой');
     showToast('Маршрутизация завершилась с ошибкой', 'error');
+    state.routesReady = false;
+    updateDownloadButton();
+    updateStatsCard(null);
   } else {
     showToast('Маршруты готовы', 'success');
+    state.routesReady = true;
+    if (data.stats) {
+      updateStatsCard(data.stats);
+    } else {
+      updateDownloadButton();
+    }
   }
 });
 
@@ -908,6 +1066,7 @@ function initialize() {
   if (!hasGoogleKey) appendLog('⚠️ GOOGLE_API_KEY не найден — маршруты будут строиться прямыми линиями');
   if (!hasYandexKey) appendLog('ℹ️ YANDEX_API_KEY отсутствует, выбирайте источник Google');
   loadRoadsLayer({ silent: true });
+  updateDownloadButton();
 }
 
 initialize();

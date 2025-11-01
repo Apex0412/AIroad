@@ -16,6 +16,7 @@ class DispatcherState:
     assignments_summary: Optional[list[dict[str, Any]]] = None
     routes_ready: bool = False
     routes_error: Optional[str] = None
+    route_stats: Optional[Dict[str, Any]] = None
     base_info: Optional[Dict[str, Any]] = None
     monitor: list[Dict[str, Any]] = field(default_factory=list)
 
@@ -41,6 +42,10 @@ def set_roads(data: Optional[Dict[str, Any]], *, error: Optional[str] = None) ->
 def set_assignments(assignments: Dict[str, str], summary: Optional[list[dict[str, Any]]] = None) -> None:
     STATE.assignments = assignments
     STATE.assignments_summary = summary
+
+
+def set_route_stats(stats: Optional[Dict[str, Any]]) -> None:
+    STATE.route_stats = stats
 
 
 def append_monitor_entry(entry: Dict[str, Any]) -> None:
