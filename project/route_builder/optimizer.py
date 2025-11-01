@@ -5,7 +5,7 @@ import heapq
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, Polygon, shape
@@ -44,6 +44,8 @@ def assign_cells_kmeans(
     tractors: Sequence[Tractor],
     advanced: bool = False,
     roads: Optional[Sequence[Road]] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    step_callback: Optional[Callable[[str, str, int, int], None]] = None,
 ) -> Tuple[Dict[str, str], List[Dict[str, float]]]:
     """Cluster cells into contiguous districts and map to tractors."""
 
@@ -99,6 +101,20 @@ def assign_cells_kmeans(
     weights = {tractor.id: 0.0 for tractor in active_tractors}
     total_weight = sum(cell.weight for cell in cells)
     target_weight = total_weight / max(len(active_tractors), 1)
+    total_cells = len(cells)
+    assigned_count = 0
+
+    if progress_callback:
+        progress_callback(0, total_cells)
+
+    def _mark_assignment(cell_id: str, tractor_id: str) -> None:
+        nonlocal assigned_count
+        assignments[cell_id] = tractor_id
+        assigned_count += 1
+        if step_callback:
+            step_callback(cell_id, tractor_id, assigned_count, total_cells)
+        if progress_callback:
+            progress_callback(assigned_count, total_cells)
 
     available = {cell.id for cell in cells}
     queue: List[Tuple[float, int, str]] = []
@@ -112,7 +128,7 @@ def assign_cells_kmeans(
             cluster_cells,
             key=lambda c: _distance((c.centroid.x, c.centroid.y), center),
         )
-        assignments[seed.id] = tractor.id
+        _mark_assignment(seed.id, tractor.id)
         weights[tractor.id] += seed.weight
         available.discard(seed.id)
         for neighbor in adjacency.get(seed.id, []):
@@ -170,7 +186,7 @@ def assign_cells_kmeans(
             heapq.heappush(queue, (priority + 5.0, cluster_idx, cell_id))
             continue
 
-        assignments[cell_id] = tractor.id
+        _mark_assignment(cell_id, tractor.id)
         weights[tractor.id] = projected
         available.remove(cell_id)
 
@@ -195,6 +211,9 @@ def assign_cells_kmeans(
                     neighbor,
                 ),
             )
+
+    if progress_callback:
+        progress_callback(total_cells, total_cells)
 
     summary: List[Dict[str, float]] = []
     for tractor in tractors:

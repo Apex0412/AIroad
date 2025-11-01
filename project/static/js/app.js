@@ -32,6 +32,9 @@ const legendEl = document.getElementById('legend');
 const buildSpinner = document.getElementById('build-spinner');
 const mapSpinner = document.getElementById('map-spinner');
 const toastContainer = document.getElementById('toast-container');
+const progressBox = document.getElementById('global-progress');
+const progressFill = progressBox ? progressBox.querySelector('.progress-fill') : null;
+const progressText = document.getElementById('progress-text');
 const gridMeta = document.getElementById('grid-meta');
 const tractorSelect = document.getElementById('tractor-select');
 const gridAlert = document.getElementById('grid-alert');
@@ -96,6 +99,17 @@ function setMapSpinner(active) {
   } else {
     mapSpinner.hidden = true;
     mapSpinner.classList.remove('active');
+  }
+}
+
+function updateGlobalProgress(stage, text, percent) {
+  if (!progressBox || !progressFill || !progressText) return;
+  const clamped = Math.min(100, Math.max(0, Number.isFinite(percent) ? Number(percent) : 0));
+  progressBox.classList.remove('hidden');
+  progressFill.style.width = `${clamped}%`;
+  progressText.textContent = text || stage || 'Прогресс';
+  if (clamped >= 100) {
+    setTimeout(() => progressBox.classList.add('hidden'), 1500);
   }
 }
 
@@ -342,10 +356,9 @@ function submitSettings() {
     .then((res) => res.json())
     .then((data) => {
       if (data.error) throw new Error(data.error);
-      appendLog('[SETTINGS] Настройки обновлены');
-      loadGridFromSettings();
+      appendLog('[SETTINGS] Настройки обновлены, обновляю сетку…');
       buildTractors();
-      showToast('Настройки сохранены', 'success');
+      showToast('Настройки сохранены, сетка обновится автоматически', 'info');
     })
     .catch((err) => {
       appendLog(`[SETTINGS ERROR] ${err.message}`);
@@ -355,8 +368,13 @@ function submitSettings() {
 }
 
 function autoAssign() {
-  setBusy('#auto-assign', true);
+  const btn = document.getElementById('auto-assign');
+  if (!btn) return;
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+  setBusy(btn, true);
+  btn.textContent = '⏳ Распределяю…';
   appendLog('[ASSIGN] Запускаю автораспределение…');
+  resetAssignments();
   fetch('/auto_assign', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -368,17 +386,18 @@ function autoAssign() {
   })
     .then((res) => res.json())
     .then((data) => {
-      if (!data.success) {
-        throw new Error(data.error || 'Автораспределение не выполнено');
+      if (data.error || data.ok === false || data.success === false) {
+        throw new Error(data.error || 'Автораспределение не запущено');
       }
-      appendLog(`🔀 Автораспределение завершено (${data.assigned})`);
-      showToast('Назначения обновлены', 'success');
+      appendLog('🔁 Автораспределение запущено, ожидайте прогресс…');
+      showToast('Автораспределение запущено', 'info');
     })
     .catch((err) => {
       appendLog(`[ASSIGN ERROR] ${err.message}`);
       showToast(err.message, 'error');
-    })
-    .finally(() => setBusy('#auto-assign', false));
+      setBusy(btn, false);
+      btn.textContent = btn.dataset.label || '🔀 Авто-раздать районы';
+    });
 }
 
 function buildRoutes() {
@@ -487,6 +506,21 @@ function handleLogEvent(data) {
 
 socket.on('log', handleLogEvent);
 
+socket.on('progress', (payload) => {
+  if (!payload) return;
+  updateGlobalProgress(payload.stage, payload.text, payload.progress);
+  if (payload.stage === 'ASSIGN') {
+    const btn = document.getElementById('auto-assign');
+    const text = String(payload.text || '').toLowerCase();
+    if (btn && btn.classList.contains('loading')) {
+      if (text.includes('ошибка') || text.includes('⚠️')) {
+        setBusy(btn, false);
+        btn.textContent = btn.dataset.label || '🔀 Авто-раздать районы';
+      }
+    }
+  }
+});
+
 socket.on('grid_ready', (data) => {
   if (data && typeof data.cells === 'number') {
     gridMeta.textContent = `Сетка: ${data.cells}`;
@@ -541,6 +575,11 @@ socket.on('settings', (payload) => {
   }
 });
 
+socket.on('update_cell_assignment', (payload) => {
+  if (!payload || !payload.cell_id || !payload.tractor) return;
+  applyAssignment(payload.cell_id, payload.tractor);
+});
+
 socket.on('assignments_updated', (payload) => {
   if (!payload || !payload.assignments) return;
   resetAssignments();
@@ -551,6 +590,12 @@ socket.on('assignments_updated', (payload) => {
       const roads = Math.round(item.roads_m || 0);
       appendLog(`[ASSIGN] ${item.tractor}: ${item.cells} клеток, ${item.area_km2.toFixed(2)} км², дорог ${roads} м`);
     });
+  }
+  const btn = document.getElementById('auto-assign');
+  if (btn && btn.classList.contains('loading')) {
+    setBusy(btn, false);
+    btn.textContent = btn.dataset.label || '🔀 Авто-раздать районы';
+    showToast('Назначения обновлены', 'success');
   }
 });
 
@@ -564,6 +609,12 @@ socket.on('roads_assignment', (data) => {
     const color = tractor ? tractor.color : '#38bdf8';
     layer.setStyle({ color, weight: 3 });
   });
+  const btn = document.getElementById('auto-assign');
+  if (btn && btn.classList.contains('loading')) {
+    setBusy(btn, false);
+    btn.textContent = btn.dataset.label || '🔀 Авто-раздать районы';
+    showToast('Назначены зоны по дорогам', 'success');
+  }
 });
 
 socket.on('route_step', (data) => {

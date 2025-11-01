@@ -105,6 +105,10 @@
       </main>
     </div>
     <div id="toast-container"></div>
+    <div id="global-progress" class="hidden">
+      <div class="progress-bar"><div class="progress-fill"></div></div>
+      <span id="progress-text">Готово</span>
+    </div>
     <script>
       const initialSettings = {{ settings|tojson }};
       const gridError = {{ grid_error|tojson }};
