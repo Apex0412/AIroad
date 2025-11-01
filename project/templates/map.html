@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <title>AIroad Dispatcher</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+  </head>
+  <body class="theme-{{ 'dark' if settings.theme == 'dark' else 'light' }}">
+    <button id="sidebar-toggle" class="sidebar-toggle" aria-label="Открыть панель">
+      ☰
+    </button>
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar">
+        <div class="brand">
+          <div class="logo">AI</div>
+          <div class="brand-text">
+            <span class="title">AIroad Dispatcher</span>
+            <span class="subtitle">Уборочная техника</span>
+          </div>
+          <button class="theme-toggle" id="theme-toggle" type="button">🌙</button>
+        </div>
+        {% if grid_error %}
+        <div class="toast toast-warn" id="grid-alert">⚠️ {{ grid_error }}</div>
+        {% else %}
+        <div class="toast toast-info" id="grid-alert" hidden>Сетка готова</div>
+        {% endif %}
+        <div class="status-strip">
+          <span class="status {{ 'ok' if has_google_key else 'warn' }}">Google {{ 'OK' if has_google_key else 'нет ключа' }}</span>
+          <span class="status {{ 'ok' if has_yandex_key else 'warn' }}">Yandex {{ 'OK' if has_yandex_key else 'нет ключа' }}</span>
+        </div>
+        <section class="status-panel" id="status-panel">
+          <header>📁 Проверка системы</header>
+          <ul id="status-list">
+            {% for item in system_status %}
+            <li class="{{ item.status }}"><strong>{{ item.label }}</strong><span>{{ item.message }}</span></li>
+            {% endfor %}
+          </ul>
+        </section>
+        <section class="panel">
+          <header class="panel-header">
+            <h2>Параметры</h2>
+            <span id="grid-meta" class="badge">Сетка: —</span>
+          </header>
+          <div class="field">
+            <label for="tractor-select">Трактор</label>
+            <select id="tractor-select"></select>
+          </div>
+          <div class="mode-switch">
+            <label><input type="radio" name="mode" value="grid" {{ 'checked' if settings.mode == 'grid' else '' }}> Сетка</label>
+            <label><input type="radio" name="mode" value="road" {{ 'checked' if settings.mode == 'road' else '' }}> Дороги</label>
+          </div>
+          <div class="toggle-group">
+            <label class="toggle"><input type="checkbox" name="advanced" {{ 'checked' if settings.advanced else '' }}> Advanced optimization</label>
+            <div class="radio-group">
+              <label><input type="radio" name="street-source" value="google" {{ 'checked' if settings.street_source == 'google' else '' }}> Google улицы</label>
+              <label><input type="radio" name="street-source" value="yandex" {{ 'checked' if settings.street_source == 'yandex' else '' }}> Yandex улицы</label>
+            </div>
+            <div class="radio-group">
+              <label><input type="radio" name="provider" value="google" {{ 'checked' if settings.routing_provider == 'google' else '' }}> Google маршруты</label>
+              <label><input type="radio" name="provider" value="yandex" {{ 'checked' if settings.routing_provider == 'yandex' else '' }}> Yandex маршруты</label>
+            </div>
+          </div>
+          <div class="grid">
+            <label for="grid-cells">Клеток в сетке</label>
+            <input id="grid-cells" type="number" min="16" max="400" value="{{ settings.grid_cells }}">
+            <label for="n-units">Количество тракторов</label>
+            <input id="n-units" type="number" min="1" max="64" value="{{ settings.n_units }}">
+            <label for="target-km">Цель на трактор (м)</label>
+            <input id="target-km" type="number" min="1000" max="100000" step="500" value="{{ settings.target_km }}">
+            <label for="travel-mode">Режим передвижения</label>
+            <select id="travel-mode">
+              <option value="driving" {{ 'selected' if settings.travel_mode == 'driving' else '' }}>Авто</option>
+              <option value="walking" {{ 'selected' if settings.travel_mode == 'walking' else '' }}>Пешком</option>
+              <option value="bicycling" {{ 'selected' if settings.travel_mode == 'bicycling' else '' }}>Велосипед</option>
+            </select>
+            <label for="max-waypoints">Макс. waypoint</label>
+            <input id="max-waypoints" type="number" min="5" max="25" value="{{ settings.max_waypoints }}" title="Лимит точек Google/Yandex Directions (рекомендуется 23)">
+            <label class="checkbox"><input type="checkbox" id="use-base-start" {{ 'checked' if settings.use_base_as_start else '' }}> Стартовать с базы</label>
+            <label for="base-lat">Base lat</label>
+            <input id="base-lat" type="number" step="0.000001" value="{{ settings.base_lat }}">
+            <label for="base-lon">Base lon</label>
+            <input id="base-lon" type="number" step="0.000001" value="{{ settings.base_lon }}">
+            <label for="center-lat">Center lat</label>
+            <input id="center-lat" type="number" step="0.000001" value="{{ settings.center_lat }}">
+            <label for="center-lon">Center lon</label>
+            <input id="center-lon" type="number" step="0.000001" value="{{ settings.center_lon }}">
+          </div>
+          <div class="button-group">
+            <button class="btn secondary" id="apply-settings">💾 Сохранить сетку</button>
+            <button class="btn secondary" id="clear-selected">🧼 Очистить трактор</button>
+            <button class="btn secondary" id="reset-all">♻️ Сбросить всё</button>
+            <button class="btn secondary" id="auto-assign">🔀 Авто-раздать районы</button>
+            <button class="btn secondary" id="check-base">🔍 Проверить базу</button>
+            <button class="btn secondary" id="system-check">🧪 Проверить систему</button>
+            <button class="btn secondary" id="clear-routes">🧹 Очистить маршруты</button>
+            <button class="btn primary" id="save-build">🧭 Построить маршруты</button>
+            <button class="btn success" id="download-kml" type="button" {{ '' if routes_ready else 'disabled' }}>⬇️ Скачать KML</button>
+            <button class="btn secondary" id="clear-log">🧾 Очистить лог</button>
+          </div>
+        </section>
+        <section class="legend" id="legend"></section>
+        <section class="log-panel">
+          <header>
+            <h2>Лог</h2>
+            <div class="spinner small" id="build-spinner" hidden></div>
+          </header>
+          <div id="log" class="log"></div>
+        </section>
+      </aside>
+      <main class="map-wrapper">
+        <div id="map"></div>
+        <div id="map-spinner" class="spinner overlay" hidden></div>
+      </main>
+    </div>
+    <div id="toast-container"></div>
+    <div id="global-progress" class="hidden">
+      <div class="progress-bar"><div class="progress-fill"></div></div>
+      <span id="progress-text">Готово</span>
+    </div>
+    <div id="route-stats" class="stats-card{{ '' if route_stats else ' hidden' }}">
+      <header>
+        <span class="stats-title">🧭 Статистика маршрутов</span>
+        <small id="stats-updated">{{ route_stats.updated_at if route_stats else '' }}</small>
+      </header>
+      <div class="stats-grid">
+        <div><span data-stat="routes">{{ route_stats.routes if route_stats else 0 }}</span><small>Маршрутов</small></div>
+        <div><span data-stat="total">{{ '%.1f'|format(route_stats.total_km) if route_stats else '0.0' }}</span><small>Общая длина, км</small></div>
+        <div><span data-stat="avg">{{ '%.1f'|format(route_stats.average_km) if route_stats else '0.0' }}</span><small>Средняя длина</small></div>
+        <div><span data-stat="cells">{{ route_stats.cells if route_stats else 0 }}</span><small>Клеток</small></div>
+        <div><span data-stat="duration">{{ '%.1f'|format(route_stats.duration_sec) if route_stats else '0.0' }}</span><small>Время, с</small></div>
+      </div>
+    </div>
+    <div id="action-monitor">
+      <header>
+        <div class="title">Монитор действий</div>
+        <div class="controls">
+          <button id="download-log" class="btn link">🧾 Скачать лог</button>
+          <button id="clear-monitor" class="btn link">🗑 Очистить</button>
+        </div>
+      </header>
+      <div class="progress-track"><div class="progress-inner"></div></div>
+      <div id="monitor-log" class="monitor-log"></div>
+    </div>
+    <script>
+      const initialSettings = {{ settings|tojson }};
+      const gridError = {{ grid_error|tojson }};
+      const tractorColors = {{ tractor_colors|tojson }};
+      const hasGoogleKey = {{ has_google_key|tojson }};
+      const hasYandexKey = {{ has_yandex_key|tojson }};
+      const initialRouteStats = {{ route_stats|tojson }};
+      const initialRoutesReady = {{ routes_ready|tojson }};
+      const initialSystemStatus = {{ system_status|tojson }};
+    </script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <script src="https://unpkg.com/leaflet-plugins/layer/vector/KML.js"></script>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+  </body>
+</html>

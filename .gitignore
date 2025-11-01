@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+project/.env
+project/data/*.kml
+project/data/routes_grid.kml
+project/data/roads_colored.kml
+project/cache/*.json
+project/data/assignments.json
+project/data/roads_assignment.json
+project/data/grid.geojson
+project/data/street_summary.csv
+project/logs/
+project/.venv/

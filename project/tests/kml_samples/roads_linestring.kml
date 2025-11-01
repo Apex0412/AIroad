@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <Placemark>
+      <name>Road A</name>
+      <LineString>
+        <coordinates>
+          37.40,54.92,0 37.41,54.93,0
+        </coordinates>
+      </LineString>
+    </Placemark>
+    <Placemark>
+      <name>Road B</name>
+      <MultiGeometry>
+        <LineString>
+          <coordinates>
+            37.41,54.93,0 37.42,54.94,0
+          </coordinates>
+        </LineString>
+      </MultiGeometry>
+    </Placemark>
+  </Document>
+</kml>
