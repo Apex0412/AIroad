@@ -514,7 +514,7 @@ def roads_geojson():
     return jsonify(geojson)
 
 
-@app.post("/system/check")
+@app.get("/system/check")
 def system_check():
     if not _system_check_lock.acquire(blocking=False):
         return jsonify({"status": "running"}), 202

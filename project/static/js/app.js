@@ -784,7 +784,7 @@ async function runSystemCheck() {
   appendLog('[SYSTEM] Запускаю проверку системы…');
   showToast('Проверка системы запущена', 'info');
   try {
-    const response = await fetch('/system/check', { method: 'POST' });
+    const response = await fetch('/system/check');
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     if (data.status === 'running') {
@@ -1139,6 +1139,9 @@ function initialize() {
 }
 
 initialize();
+if (systemCheckBtn) {
+  runSystemCheck();
+}
 
 window.addEventListener('resize', () => {
   if (window.innerWidth >= 992) sidebar.classList.remove('open');
