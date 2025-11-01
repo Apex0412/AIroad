@@ -320,11 +320,38 @@
       let tractorList = JSON.parse(document.body.dataset.initialTractors || "[]");
       const socket = io();
 
-      const map = L.map("map").setView([settingsState.center_lat || 0, settingsState.center_lon || 0], 12.5);
+      const DEFAULT_CENTER = { lat: 54.920031, lon: 37.40809, zoom: 12.5 };
+
+      const coerceNumber = (value, fallback) => {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : fallback;
+      };
+
+      const normaliseSettings = (state) => {
+        if (!state || typeof state !== "object") {
+          return settingsState;
+        }
+        state.center_lat = coerceNumber(state.center_lat, DEFAULT_CENTER.lat);
+        state.center_lon = coerceNumber(state.center_lon, DEFAULT_CENTER.lon);
+        state.base_lat = coerceNumber(state.base_lat, DEFAULT_CENTER.lat);
+        state.base_lon = coerceNumber(state.base_lon, DEFAULT_CENTER.lon);
+        state.n_units = Math.max(1, Math.round(coerceNumber(state.n_units, 1)));
+        state.target_km = coerceNumber(state.target_km, 30);
+        state.max_waypoints = Math.max(1, Math.round(coerceNumber(state.max_waypoints, 23)));
+        state.grid_cells = Math.max(1, Math.round(coerceNumber(state.grid_cells, 64)));
+        return state;
+      };
+
+      normaliseSettings(settingsState);
+
+      const initialLat = settingsState.center_lat;
+      const initialLon = settingsState.center_lon;
+      const map = L.map("map").setView([initialLat, initialLon], DEFAULT_CENTER.zoom);
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
         maxZoom: 18,
         attribution: '&copy; <a href="https://www.openstreetmap.org/">OpenStreetMap</a> contributors',
       }).addTo(map);
+      map.whenReady(() => map.invalidateSize());
 
       const assignments = {};
       const sectorLayers = new Map();
@@ -395,6 +422,7 @@
       socket.on("settings", ({ settings, tractors }) => {
         if (settings && typeof settings === "object") {
           Object.assign(settingsState, settings);
+          normaliseSettings(settingsState);
           updateGridIndicators();
           applySettingsSummary();
           applySettingsToForm();
@@ -435,15 +463,15 @@
       }
 
       function applySettingsToForm() {
-        nUnitsInput.value = settingsState.n_units || 1;
-        targetKmInput.value = settingsState.target_km || 30;
+        nUnitsInput.value = settingsState.n_units;
+        targetKmInput.value = settingsState.target_km.toString();
         travelModeInput.value = settingsState.travel_mode || "driving";
-        maxWaypointsInput.value = settingsState.max_waypoints || 23;
+        maxWaypointsInput.value = settingsState.max_waypoints;
         useBaseCheckbox.checked = Boolean(settingsState.use_base_as_start);
-        baseLatInput.value = settingsState.base_lat || 0;
-        baseLonInput.value = settingsState.base_lon || 0;
-        centerLatInput.value = settingsState.center_lat || 0;
-        centerLonInput.value = settingsState.center_lon || 0;
+        baseLatInput.value = coerceNumber(settingsState.base_lat, DEFAULT_CENTER.lat).toFixed(6);
+        baseLonInput.value = coerceNumber(settingsState.base_lon, DEFAULT_CENTER.lon).toFixed(6);
+        centerLatInput.value = coerceNumber(settingsState.center_lat, DEFAULT_CENTER.lat).toFixed(6);
+        centerLonInput.value = coerceNumber(settingsState.center_lon, DEFAULT_CENTER.lon).toFixed(6);
         if (gridSelect && settingsState.grid_cells) {
           gridSelect.value = String(settingsState.grid_cells);
         }
@@ -453,13 +481,13 @@
         const targetText = settingsState.target_km ? `Цель: около ${Number(settingsState.target_km).toFixed(1)} км на трактор.` : "";
         const tractorsText = settingsState.n_units ? ` Всего тракторов: ${settingsState.n_units}.` : "";
         targetSummary.textContent = targetText + tractorsText;
-        if (settingsState.center_lat && settingsState.center_lon) {
-          centerSummary.textContent = `Карта центрирована в точке ${settingsState.center_lat}, ${settingsState.center_lon}`;
-        } else {
-          centerSummary.textContent = "";
-        }
-        if (map && settingsState.center_lat && settingsState.center_lon) {
-          map.setView([settingsState.center_lat, settingsState.center_lon], map.getZoom());
+        const resolvedLat = coerceNumber(settingsState.center_lat, DEFAULT_CENTER.lat);
+        const resolvedLon = coerceNumber(settingsState.center_lon, DEFAULT_CENTER.lon);
+        settingsState.center_lat = resolvedLat;
+        settingsState.center_lon = resolvedLon;
+        centerSummary.textContent = `Карта центрирована в точке ${resolvedLat.toFixed(6)}, ${resolvedLon.toFixed(6)}`;
+        if (map) {
+          map.setView([resolvedLat, resolvedLon], map.getZoom());
         }
       }
 
@@ -510,6 +538,8 @@
             const bounds = geoLayer.getBounds();
             if (bounds.isValid()) {
               map.fitBounds(bounds, { padding: [40, 40] });
+            } else {
+              map.setView([DEFAULT_CENTER.lat, DEFAULT_CENTER.lon], DEFAULT_CENTER.zoom);
             }
             setTimeout(() => map.invalidateSize(), 100);
             if (!geojson?.features?.length) {
@@ -609,6 +639,7 @@
             appendLog("Параметры обновлены на сервере");
             if (data?.settings) {
               Object.assign(settingsState, data.settings);
+              normaliseSettings(settingsState);
               applySettingsSummary();
               applySettingsToForm();
               updateGridIndicators();

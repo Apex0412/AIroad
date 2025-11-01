@@ -15,10 +15,10 @@ class BuildDefaults:
     travel_mode: str = "driving"
     max_waypoints: int = 23
     use_base_as_start: bool = True
-    base_lat: float = 55.751244
-    base_lon: float = 37.618423
-    center_lat: float = 55.751244
-    center_lon: float = 37.618423
+    base_lat: float = 54.920031
+    base_lon: float = 37.40809
+    center_lat: float = 54.920031
+    center_lon: float = 37.40809
 
 
 TRACTOR_COLORS: List[str] = [

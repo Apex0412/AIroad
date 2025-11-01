@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import subprocess
@@ -11,6 +12,9 @@ from flask import Flask, Response, jsonify, render_template, request, send_file
 from flask_socketio import SocketIO, emit
 
 from config_defaults import BuildDefaults, GRID_CELL_OPTIONS, TRACTOR_COLORS
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 APP_ROOT = Path(__file__).parent.resolve()
 load_dotenv(APP_ROOT / ".env")
@@ -26,7 +30,7 @@ ROUTES_KML = APP_ROOT / "routes_grid.kml"
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET", "tractor-secret")
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", logger=True, engineio_logger=True)
 
 _assignments_lock = threading.Lock()
 _settings_lock = threading.Lock()
@@ -208,12 +212,15 @@ def initialize_state() -> None:
     if _initialized:
         return
     app.logger.info("Инициализация сервера...")
+    app.logger.info("Загружаю переменные окружения из %s", _dotenv_path)
     refresh_env()
     with _settings_lock:
         _current_settings.clear()
+        app.logger.info("Читаю настройки приложения из %s", SETTINGS_PATH)
         _current_settings.update(load_settings())
         save_settings(_current_settings)
     try:
+        app.logger.info("Проверяю наличие сетки (%s клеток)", _current_settings.get("grid_cells"))
         ensure_grid_exists(_current_settings.get("grid_cells"))
         _grid_error = None
     except Exception as exc:  # noqa: BLE001
@@ -221,6 +228,7 @@ def initialize_state() -> None:
         app.logger.error("Ошибка генерации сетки", exc_info=exc)
     with _assignments_lock:
         _current_assignments.clear()
+        app.logger.info("Загружаю назначения из %s", ASSIGNMENTS_PATH)
         _current_assignments.update(load_assignments())
         prune_assignments(_current_settings)
     _initialized = True
