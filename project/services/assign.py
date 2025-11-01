@@ -4,15 +4,17 @@ from __future__ import annotations
 import json
 from typing import Dict, Iterable, List, Optional, Sequence
 
-from config import ASSIGNMENTS_JSON, ROADS_ASSIGN_JSON
-from route_builder.optimizer import (
+# FIX: pull config paths via parent package for compatibility with repo-level entrypoint
+from ..config import ASSIGNMENTS_JSON, ROADS_ASSIGN_JSON
+# FIX: address route builder imports via project package namespace
+from ..route_builder.optimizer import (
     Tractor,
     assign_cells_kmeans,
     assign_roads_advanced,
     assign_roads_simple,
 )
-from route_builder.roads import Road
-from utils.progress import emit_progress
+from ..route_builder.roads import Road
+from ..utils.progress import emit_progress
 
 
 def save_cell_assignments(assignments: Dict[str, str]) -> None:

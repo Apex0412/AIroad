@@ -12,7 +12,8 @@ from flask import Flask, Response, jsonify, render_template, request, send_file
 from flask_socketio import SocketIO
 from shapely.geometry import MultiPolygon, Point, Polygon
 
-from config import (
+# FIX: use package-relative import so python -m project.server resolves config correctly
+from .config import (
     APP_ROOT,
     ASSIGNMENTS_JSON,
     DATA_DIR,
@@ -29,11 +30,13 @@ from config import (
     load_settings as config_load_settings,
     save_settings as config_save_settings,
 )
-from route_builder import TRACTOR_COLORS
-from route_builder.optimizer import Tractor
-from services import state as state_store
-from services.bootstrap import ensure_initial_files
-from services.state import (
+# FIX: access route builder modules through project package to keep imports stable
+from .route_builder import TRACTOR_COLORS
+from .route_builder.optimizer import Tractor
+# FIX: import service modules via relative package paths to avoid ModuleNotFound errors
+from .services import state as state_store
+from .services.bootstrap import ensure_initial_files
+from .services.state import (
     append_monitor_entry,
     reset_routes,
     set_assignments,
@@ -42,23 +45,24 @@ from services.state import (
     set_route_stats,
     set_system_status,
 )
-from services.system_check import run_system_check
-from services.assign import (
+from .services.system_check import run_system_check
+from .services.assign import (
     auto_assign_cells,
     auto_assign_roads,
     load_cell_assignments,
 )
-from services.kml_io import (
+from .services.kml_io import (
     ZoneLoadError,
     build_grid,
     load_grid_file,
     read_roads_kml,
     read_zone_kml,
 )
-from services.routing import build_routes
-from services.tasks import run_async
-from utils.progress import emit_progress, init_progress
-from utils.validator import validate_geo_kml
+from .services.routing import build_routes
+from .services.tasks import run_async
+# FIX: consume utility modules through package-relative imports when launched from repo root
+from .utils.progress import emit_progress, init_progress
+from .utils.validator import validate_geo_kml
 
 load_dotenv(APP_ROOT / ".env", override=True)
 

@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from typing import List
 
-from config import GEO_PATH, ROADS_PATH, STATE_JSON
+# FIX: reference config via parent package to support repo-root server entrypoint
+from ..config import GEO_PATH, ROADS_PATH, STATE_JSON
 
 TEST_GEO_TEMPLATE = """<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n  <Placemark>\n    <name>Test boundary</name>\n    <Polygon>\n      <outerBoundaryIs>\n        <LinearRing>\n          <coordinates>\n            {coords}\n          </coordinates>\n        </LinearRing>\n      </outerBoundaryIs>\n    </Polygon>\n  </Placemark>\n</kml>\n"""
 

@@ -7,7 +7,8 @@ from typing import Literal, Optional
 
 import requests
 
-from config import STREETS_CACHE, env_google_key, env_yandex_key
+# FIX: access config helpers via parent package to keep project.server importable
+from ..config import STREETS_CACHE, env_google_key, env_yandex_key
 
 _REQUEST_TIMEOUT = 3
 _MAX_RETRIES = 3

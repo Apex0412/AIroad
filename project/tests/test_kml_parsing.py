@@ -8,7 +8,8 @@ pytest.importorskip("shapely")
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from services.kml_io import read_roads_kml, read_zone_kml
+# FIX: import loaders via package-relative path for test execution
+from ..services.kml_io import read_roads_kml, read_zone_kml
 
 SAMPLES = Path(__file__).resolve().parent / "kml_samples"
 

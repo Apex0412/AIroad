@@ -6,9 +6,10 @@ from typing import Dict, List
 
 import requests
 
-from config import GEO_PATH, ROADS_PATH
-from services.kml_io import ZoneLoadError, read_roads_kml, read_zone_kml
-from utils.validator import validate_geo_kml
+# FIX: import config from parent package to avoid ModuleNotFound when launched via repo-level server
+from ..config import GEO_PATH, ROADS_PATH
+from .kml_io import ZoneLoadError, read_roads_kml, read_zone_kml
+from ..utils.validator import validate_geo_kml
 
 REQUEST_TIMEOUT = 6
 

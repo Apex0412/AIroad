@@ -9,7 +9,8 @@ import time
 from collections import defaultdict
 from typing import Dict
 
-from config import (
+# FIX: rely on package-relative config imports when server is launched from repo root
+from ..config import (
     APP_ROOT,
     GEO_PATH,
     ROADS_ASSIGN_JSON,
@@ -20,7 +21,8 @@ from config import (
 from shapely.geometry import Point
 
 from .kml_io import read_roads_kml, read_zone_kml
-from utils.progress import emit_progress
+# FIX: resolve shared utilities relative to the project package
+from ..utils.progress import emit_progress
 
 from .geo import is_valid_coord
 

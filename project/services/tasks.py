@@ -5,7 +5,8 @@ from functools import wraps
 from threading import Lock, Thread
 from typing import Any, Callable
 
-from utils.progress import emit_progress
+# FIX: reuse shared progress helper through project package namespace
+from ..utils.progress import emit_progress
 
 
 class TaskLock:

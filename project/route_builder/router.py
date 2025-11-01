@@ -7,7 +7,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from utils.apis import ApiError, request_directions
+# FIX: consume API helpers via package-relative import for consistent package execution
+from ..utils.apis import ApiError, request_directions
 
 from .optimizer import Tractor
 from .roads import Road

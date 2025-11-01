@@ -7,10 +7,13 @@ from typing import Dict, List, Optional
 
 from shapely.geometry import MultiPolygon
 
-from config import GRID_GEOJSON
-from route_builder.grid import generate_grid, load_geo_boundary, save_grid_geojson
-from route_builder.roads import Road, load_roads
-from utils.validator import validate_geo_kml
+# FIX: resolve config via package-relative import so server entrypoint works from repo root
+from ..config import GRID_GEOJSON
+# FIX: import builder helpers via project package namespaces
+from ..route_builder.grid import generate_grid, load_geo_boundary, save_grid_geojson
+from ..route_builder.roads import Road, load_roads
+# FIX: validator is part of project.utils; use relative import for consistency
+from ..utils.validator import validate_geo_kml
 
 
 class ZoneLoadError(RuntimeError):

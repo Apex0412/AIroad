@@ -6,7 +6,8 @@ from typing import Iterable, List, Literal, Optional, Sequence, Tuple
 
 import requests
 
-from config import env_google_key, env_yandex_key
+# FIX: pull API keys from package-relative config for repo-root entrypoint compatibility
+from ..config import env_google_key, env_yandex_key
 
 Coordinate = Tuple[float, float]
 
