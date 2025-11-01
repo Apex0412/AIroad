@@ -6,7 +6,9 @@ const state = {
   mode: initialSettings.mode || 'grid',
   advanced: Boolean(initialSettings.advanced),
   streetSource: initialSettings.street_source || 'google',
+  provider: initialSettings.routing_provider || 'google',
   building: false,
+  theme: 'light',
 };
 
 const map = L.map('map', { zoomControl: false }).setView(
@@ -19,22 +21,75 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '&copy; OpenStreetMap contributors',
 }).addTo(map);
 
-const spinner = document.getElementById('spinner');
-const gridMeta = document.getElementById('grid-meta');
-const advancedToggle = document.querySelector('input[name="advanced"]');
+const socket = io();
+
+// Elements
+const sidebar = document.getElementById('sidebar');
+const sidebarToggle = document.getElementById('sidebar-toggle');
+const themeToggle = document.getElementById('theme-toggle');
 const logEl = document.getElementById('log');
+const legendEl = document.getElementById('legend');
+const buildSpinner = document.getElementById('build-spinner');
+const mapSpinner = document.getElementById('map-spinner');
+const toastContainer = document.getElementById('toast-container');
+const gridMeta = document.getElementById('grid-meta');
+const tractorSelect = document.getElementById('tractor-select');
+const gridAlert = document.getElementById('grid-alert');
 
 const sectorLayers = new Map();
 const routeLayers = new Map();
 const roadLayers = new Map();
-let kmlLayer = null;
+let gridLayer = null;
 let roadsLayer = null;
+let kmlLayer = null;
 
-const socket = io();
+const themePreference = localStorage.getItem('dispatcher-theme');
+if (themePreference === 'dark') {
+  document.body.classList.add('theme-dark');
+  state.theme = 'dark';
+  themeToggle.textContent = '☀️';
+}
+
+function toggleSidebar(force) {
+  if (window.innerWidth >= 992) return;
+  const open = typeof force === 'boolean' ? force : !sidebar.classList.contains('open');
+  sidebar.classList.toggle('open', open);
+}
+
+sidebarToggle.addEventListener('click', () => toggleSidebar());
+
+function applyTheme(next) {
+  state.theme = next;
+  document.body.classList.toggle('theme-dark', next === 'dark');
+  themeToggle.textContent = next === 'dark' ? '☀️' : '🌙';
+  localStorage.setItem('dispatcher-theme', next);
+}
+
+themeToggle.addEventListener('click', () => {
+  applyTheme(state.theme === 'dark' ? 'light' : 'dark');
+});
+
+function showToast(message, kind = 'info', timeout = 4000) {
+  const toast = document.createElement('div');
+  toast.className = `toast-message ${kind}`;
+  toast.textContent = message;
+  toastContainer.appendChild(toast);
+  setTimeout(() => toast.remove(), timeout);
+}
 
 function setSpinner(active) {
   state.building = active;
-  spinner.classList.toggle('active', active);
+  buildSpinner.hidden = !active;
+}
+
+function setMapSpinner(active) {
+  if (active) {
+    mapSpinner.hidden = false;
+    mapSpinner.classList.add('active');
+  } else {
+    mapSpinner.hidden = true;
+    mapSpinner.classList.remove('active');
+  }
 }
 
 function classifyMessage(message) {
@@ -42,7 +97,7 @@ function classifyMessage(message) {
   const text = message.toLowerCase();
   if (text.includes('error') || text.includes('ошибка') || text.includes('❌')) return 'error';
   if (text.includes('⚠️') || text.includes('warn')) return 'warn';
-  if (text.includes('✅') || text.includes('готов') || text.includes('done') || text.includes('[done]')) return 'success';
+  if (text.includes('✅') || text.includes('готов') || text.includes('[done]')) return 'success';
   return 'info';
 }
 
@@ -68,16 +123,33 @@ function buildTractors() {
       id: `tractor_${String(i + 1).padStart(2, '0')}`,
       name: `Трактор ${String(i + 1).padStart(2, '0')}`,
       color: tractorColors[i % tractorColors.length],
+      length: 0,
     });
   }
   state.currentTractor = state.tractors[0]?.id || null;
-  const select = document.getElementById('tractor-select');
-  select.innerHTML = '';
+  tractorSelect.innerHTML = '';
   state.tractors.forEach((tractor) => {
     const option = document.createElement('option');
     option.value = tractor.id;
     option.textContent = tractor.name;
-    select.appendChild(option);
+    tractorSelect.appendChild(option);
+  });
+  renderLegend();
+}
+
+function renderLegend() {
+  legendEl.innerHTML = '';
+  state.tractors.forEach((tractor) => {
+    const item = document.createElement('div');
+    item.className = 'item';
+    const color = document.createElement('span');
+    color.className = 'color';
+    color.style.background = tractor.color;
+    item.appendChild(color);
+    const label = document.createElement('span');
+    label.textContent = `${tractor.name}${tractor.length ? ` · ${tractor.length.toFixed(1)} км` : ''}`;
+    item.appendChild(label);
+    legendEl.appendChild(item);
   });
 }
 
@@ -87,7 +159,7 @@ function getTractorById(id) {
 
 function styleForTractor(id) {
   const tractor = getTractorById(id);
-  if (!tractor) return { color: '#94a3b8', fillColor: '#1f2937' };
+  if (!tractor) return { color: '#5f6b7a', fillColor: '#1f2937' };
   return { color: '#cbd5f5', fillColor: tractor.color };
 }
 
@@ -97,10 +169,7 @@ function updateLayerTooltip(layer, sectorId, tractorId) {
     layer.unbindTooltip();
     return;
   }
-  layer.bindTooltip(
-    `${tractor.name}<br>Сектор: ${sectorId}`,
-    { sticky: true, opacity: 0.85 },
-  );
+  layer.bindTooltip(`${tractor.name}<br>Сектор: ${sectorId}`, { sticky: true, opacity: 0.85 });
 }
 
 function applyAssignment(sectorId, tractorId) {
@@ -136,69 +205,93 @@ function highlightLayer(layer, tractorId) {
 
 function resetHighlight(layer, tractorId) {
   const style = styleForTractor(tractorId);
-  layer.setStyle({
-    color: tractorId ? style.color : '#1e3352',
-    weight: 1,
-  });
+  layer.setStyle({ color: tractorId ? style.color : '#1e3352', weight: 1 });
 }
 
-function loadGrid() {
+function renderGrid(data) {
+  if (gridLayer) {
+    gridLayer.remove();
+  }
+  resetAssignments();
+  sectorLayers.clear();
+  gridLayer = L.geoJSON(data, {
+    style: { color: '#1e3352', weight: 1, fillOpacity: 0.18, fillColor: '#10213b' },
+    onEachFeature(feature, layer) {
+      const { id } = feature.properties;
+      layer.on('click', () => {
+        if (!state.currentTractor) return;
+        applyAssignment(id, state.currentTractor);
+        socket.emit('assign_sector', { sector_id: id, tractor_id: state.currentTractor });
+      });
+      layer.on('mouseover', () => highlightLayer(layer, state.assignments[id]));
+      layer.on('mouseout', () => resetHighlight(layer, state.assignments[id]));
+      sectorLayers.set(id, layer);
+    },
+  }).addTo(map);
+  if (gridLayer.getBounds().isValid()) {
+    map.fitBounds(gridLayer.getBounds(), { padding: [20, 20] });
+  }
+  setMapSpinner(false);
+}
+
+function fetchGrid() {
+  setMapSpinner(true);
   fetch('/grid')
     .then((res) => {
       if (!res.ok) {
-        return res.json().then((data) => {
-          throw new Error(data.error || 'Ошибка загрузки сетки');
-        });
+        return res.json().then((data) => { throw new Error(data.error || 'Ошибка загрузки сетки'); });
       }
       return res.json();
     })
     .then((data) => {
-      if (window.gridLayer) {
-        window.gridLayer.remove();
-      }
-      resetAssignments();
-      sectorLayers.clear();
-      window.gridLayer = L.geoJSON(data, {
-        style: { color: '#1e3352', weight: 1, fillOpacity: 0.18, fillColor: '#10213b' },
-        onEachFeature(feature, layer) {
-          const { id } = feature.properties;
-          layer.on('click', () => {
-            if (!state.currentTractor) return;
-            applyAssignment(id, state.currentTractor);
-            socket.emit('assign_sector', { sector_id: id, tractor_id: state.currentTractor });
-          });
-          layer.on('mouseover', () => highlightLayer(layer, state.assignments[id]));
-          layer.on('mouseout', () => resetHighlight(layer, state.assignments[id]));
-          sectorLayers.set(id, layer);
-        },
-      }).addTo(map);
-      if (window.gridLayer.getBounds().isValid()) {
-        map.fitBounds(window.gridLayer.getBounds());
-      }
+      renderGrid(data);
     })
-    .catch((err) => appendLog(`[GRID ERROR] ${err.message}`));
+    .catch((err) => {
+      appendLog(`[GRID ERROR] ${err.message}`);
+      setMapSpinner(false);
+    });
 }
 
-function loadRoads() {
+function loadRoadsLayer({ silent = false } = {}) {
+  if (!silent) setMapSpinner(true);
   fetch('/roads')
     .then((res) => {
       if (!res.ok) throw new Error('Дороги недоступны');
       return res.json();
     })
     .then((data) => {
-      if (roadsLayer) {
-        roadsLayer.remove();
-      }
+      if (roadsLayer) roadsLayer.remove();
       roadLayers.clear();
       roadsLayer = L.geoJSON(data, {
-        style: { color: '#64748b', weight: 2 },
+        style: { color: '#94a3b8', weight: 2 },
         onEachFeature(feature, layer) {
           roadLayers.set(feature.properties.id, layer);
           layer.bindTooltip(feature.properties.name || 'Без названия', { opacity: 0.8 });
         },
       }).addTo(map);
+      if (roadsLayer.getBounds().isValid() && state.mode === 'road') {
+        map.fitBounds(roadsLayer.getBounds(), { padding: [20, 20] });
+      }
+      if (!silent) setMapSpinner(false);
     })
-    .catch(() => appendLog('[ROADS] ⚠️ Дороги не загружены'));
+    .catch(() => {
+      appendLog('[ROADS] ⚠️ Дороги не загружены');
+      if (!silent) setMapSpinner(false);
+    });
+}
+
+function setMode(newMode) {
+  if (state.mode === newMode) return;
+  state.mode = newMode;
+  appendLog(`[MAP] Переключено: ${newMode === 'grid' ? 'Сетка' : 'Дороги'}`);
+  setMapSpinner(true);
+  if (newMode === 'grid') {
+    if (roadsLayer) roadsLayer.remove();
+    fetchGrid();
+  } else {
+    if (gridLayer) gridLayer.remove();
+    loadRoadsLayer();
+  }
 }
 
 function submitSettings() {
@@ -216,6 +309,7 @@ function submitSettings() {
     mode: state.mode,
     advanced: state.advanced,
     street_source: state.streetSource,
+    routing_provider: state.provider,
   };
   fetch('/settings', {
     method: 'POST',
@@ -226,7 +320,7 @@ function submitSettings() {
     .then((data) => {
       if (data.error) throw new Error(data.error);
       appendLog('[SETTINGS] Настройки обновлены');
-      loadGrid();
+      loadGridFromSettings();
       buildTractors();
     })
     .catch((err) => appendLog(`[SETTINGS ERROR] ${err.message}`));
@@ -245,16 +339,22 @@ function autoAssign() {
       appendLog(`🔀 Автораспределение завершено (${data.assigned})`);
       if (Array.isArray(data.summary)) {
         data.summary.forEach((item) => {
-          appendLog(`[ASSIGN] ${item.tractor}: ${item.cells} клеток, ${item.area_km2.toFixed(2)} км², дорог ${Math.round(item.roads_m)} м`);
+          const roads = Math.round(item.roads_m || 0);
+          appendLog(`[ASSIGN] ${item.tractor}: ${item.cells} клеток, ${item.area_km2.toFixed(2)} км², дорог ${roads} м`);
         });
       }
+      showToast('Автораспределение выполнено', 'success');
     })
-    .catch((err) => appendLog(`[ASSIGN ERROR] ${err.message}`));
+    .catch((err) => {
+      appendLog(`[ASSIGN ERROR] ${err.message}`);
+      showToast(err.message, 'error');
+    });
 }
 
 function buildRoutes() {
   appendLog('🚀 Запуск построения маршрутов');
   setSpinner(true);
+  disableDuringBuild(true);
   fetch('/build_routes', { method: 'POST' })
     .then((res) => res.json())
     .then((data) => {
@@ -263,7 +363,15 @@ function buildRoutes() {
     .catch((err) => {
       appendLog(`[ROUTE ERROR] ${err.message}`);
       setSpinner(false);
+      disableDuringBuild(false);
     });
+}
+
+function disableDuringBuild(flag) {
+  const buttons = document.querySelectorAll('.btn');
+  buttons.forEach((btn) => {
+    if (btn.id !== 'download-kml') btn.disabled = flag;
+  });
 }
 
 function downloadKml() {
@@ -280,6 +388,97 @@ function clearRoutes() {
     .catch((err) => appendLog(`[ROUTE ERROR] ${err.message}`));
 }
 
+function clearAssignmentsForCurrent() {
+  const target = state.currentTractor;
+  if (!target) return;
+  Object.entries(state.assignments).forEach(([sectorId, tractorId]) => {
+    if (tractorId === target) {
+      delete state.assignments[sectorId];
+      const layer = sectorLayers.get(sectorId);
+      if (layer) {
+        layer.setStyle({ color: '#1e3352', fillColor: '#10213b', fillOpacity: 0.18, weight: 1 });
+        layer.unbindTooltip();
+      }
+    }
+  });
+  socket.emit('assignments_reset', { tractor_id: target });
+}
+
+function resetAllAssignments() {
+  resetAssignments();
+  socket.emit('assignments_reset', {});
+}
+
+tractorSelect.addEventListener('change', (event) => {
+  state.currentTractor = event.target.value;
+});
+
+document.getElementById('apply-settings').addEventListener('click', submitSettings);
+document.getElementById('auto-assign').addEventListener('click', autoAssign);
+document.getElementById('save-build').addEventListener('click', buildRoutes);
+document.getElementById('download-kml').addEventListener('click', downloadKml);
+document.getElementById('clear-routes').addEventListener('click', clearRoutes);
+document.getElementById('clear-selected').addEventListener('click', clearAssignmentsForCurrent);
+document.getElementById('reset-all').addEventListener('click', resetAllAssignments);
+
+Array.from(document.querySelectorAll('input[name="mode"]')).forEach((el) => {
+  el.addEventListener('change', () => {
+    setMode(el.value);
+  });
+});
+
+Array.from(document.querySelectorAll('input[name="street-source"]')).forEach((el) => {
+  el.addEventListener('change', () => {
+    state.streetSource = el.value;
+    appendLog(`[STREET] Источник улиц: ${state.streetSource}`);
+  });
+});
+
+Array.from(document.querySelectorAll('input[name="provider"]')).forEach((el) => {
+  el.addEventListener('change', () => {
+    state.provider = el.value;
+    appendLog(`[ROUTING] Провайдер маршрутов: ${state.provider}`);
+  });
+});
+
+const advancedToggle = document.querySelector('input[name="advanced"]');
+if (advancedToggle) {
+  advancedToggle.addEventListener('change', () => {
+    state.advanced = advancedToggle.checked;
+    appendLog(`[ADVANCED] ${state.advanced ? 'Включено' : 'Отключено'}`);
+  });
+}
+
+function handleLogEvent(data) {
+  if (data && data.message) appendLog(data.message);
+}
+
+socket.on('progress', handleLogEvent);
+socket.on('log', handleLogEvent);
+
+socket.on('grid_ready', (data) => {
+  if (data && typeof data.cells === 'number') {
+    gridMeta.textContent = `Сетка: ${data.cells}`;
+  }
+});
+
+socket.on('grid_error', (payload) => {
+  if (payload && payload.message) {
+    gridAlert.hidden = false;
+    gridAlert.textContent = `⚠️ ${payload.message}`;
+    appendLog(`[GRID ERROR] ${payload.message}`);
+  } else {
+    gridAlert.hidden = true;
+    appendLog('[GRID] Сетка готова к работе');
+  }
+});
+
+socket.on('grid_updated', (data) => {
+  if (state.mode === 'grid') {
+    renderGrid(data);
+  }
+});
+
 socket.on('settings', (payload) => {
   Object.assign(initialSettings, payload.settings);
   document.getElementById('grid-cells').value = initialSettings.grid_cells;
@@ -295,11 +494,14 @@ socket.on('settings', (payload) => {
   state.mode = initialSettings.mode || state.mode;
   state.advanced = Boolean(initialSettings.advanced);
   state.streetSource = initialSettings.street_source || state.streetSource;
+  state.provider = initialSettings.routing_provider || state.provider;
   const modeInput = document.querySelector(`input[name="mode"][value="${state.mode}"]`);
   if (modeInput) modeInput.checked = true;
   if (advancedToggle) advancedToggle.checked = state.advanced;
   const streetInput = document.querySelector(`input[name="street-source"][value="${state.streetSource}"]`);
   if (streetInput) streetInput.checked = true;
+  const providerInput = document.querySelector(`input[name="provider"][value="${state.provider}"]`);
+  if (providerInput) providerInput.checked = true;
   if (state.tractors.length !== initialSettings.n_units) {
     buildTractors();
   }
@@ -323,15 +525,6 @@ socket.on('roads_assignment', (data) => {
   });
 });
 
-function handleLogEvent(data) {
-  if (data && data.message) {
-    appendLog(data.message);
-  }
-}
-
-socket.on('progress', handleLogEvent);
-socket.on('log', handleLogEvent);
-
 socket.on('route_step', (data) => {
   const { tractor_id: tractorId, coords } = data;
   if (!routeLayers.has(tractorId)) {
@@ -345,7 +538,16 @@ socket.on('route_step', (data) => {
   coords.forEach(([lat, lon]) => layer.addLatLng([lat, lon]));
 });
 
-socket.on('tractor_done', () => appendLog('✅ Один из тракторов завершил маршрут'));
+socket.on('tractor_done', (info) => {
+  appendLog('✅ Один из тракторов завершил маршрут');
+  if (info && info.tractor && info.length) {
+    const tractor = getTractorById(info.tractor);
+    if (tractor) {
+      tractor.length = Number(info.length);
+      renderLegend();
+    }
+  }
+});
 
 socket.on('clear_routes', () => {
   routeLayers.forEach((layer) => map.removeLayer(layer));
@@ -358,6 +560,7 @@ socket.on('clear_routes', () => {
 
 socket.on('routes_ready', () => {
   setSpinner(false);
+  disableDuringBuild(false);
   fetch('/routes_grid.kml')
     .then((res) => res.text())
     .then((kmlText) => {
@@ -371,94 +574,44 @@ socket.on('routes_ready', () => {
     });
 });
 
+socket.on('build_status', (payload) => {
+  if (!payload) return;
+  setSpinner(Boolean(payload.running));
+  if (!payload.running) disableDuringBuild(false);
+});
+
 socket.on('build_done', (data) => {
   setSpinner(false);
+  disableDuringBuild(false);
   if (!data?.success) {
     appendLog('[ROUTE ERROR] Построение завершилось с ошибкой');
+    showToast('Маршрутизация завершилась с ошибкой', 'error');
+  } else {
+    showToast('Маршруты готовы', 'success');
   }
 });
 
-socket.on('grid_ready', (data) => {
-  if (data && typeof data.cells === 'number') {
-    gridMeta.textContent = `Сетка: ${data.cells}`;
+function loadGridFromSettings() {
+  if (state.mode === 'grid') {
+    fetchGrid();
   }
-});
+}
 
-socket.on('grid_error', (payload) => {
-  if (!payload || !payload.message) {
-    appendLog('[GRID] Сетка готова к работе');
-    return;
+function initialize() {
+  buildTractors();
+  if (state.mode === 'grid') {
+    fetchGrid();
+  } else {
+    loadRoadsLayer();
   }
-  gridMeta.textContent = 'Сетка: —';
-  appendLog(`[GRID ERROR] ${payload.message}`);
-});
-
-buildTractors();
-loadGrid();
-loadRoads();
-
-if (gridError) {
-  appendLog(`[GRID ERROR] ${gridError}`);
-}
-if (!hasGoogleKey) {
-  appendLog('⚠️ GOOGLE_MAPS_API_KEY не найден — маршруты будут строиться прямыми линиями');
-}
-if (!hasYandexKey) {
-  appendLog('ℹ️ YANDEX_GEOCODER_API_KEY отсутствует, выбирайте источник Google');
+  if (gridError) appendLog(`[GRID ERROR] ${gridError}`);
+  if (!hasGoogleKey) appendLog('⚠️ GOOGLE_API_KEY не найден — маршруты будут строиться прямыми линиями');
+  if (!hasYandexKey) appendLog('ℹ️ YANDEX_API_KEY отсутствует, выбирайте источник Google');
+  loadRoadsLayer({ silent: true });
 }
 
-document.getElementById('tractor-select').addEventListener('change', (event) => {
-  state.currentTractor = event.target.value;
-});
+initialize();
 
-document.getElementById('clear-selected').addEventListener('click', () => {
-  const target = state.currentTractor;
-  if (!target) return;
-  Object.entries(state.assignments).forEach(([sectorId, tractorId]) => {
-    if (tractorId === target) {
-      delete state.assignments[sectorId];
-      const layer = sectorLayers.get(sectorId);
-      if (layer) {
-        layer.setStyle({ color: '#1e3352', fillColor: '#10213b', fillOpacity: 0.18, weight: 1 });
-        layer.unbindTooltip();
-      }
-    }
-  });
-  socket.emit('assignments_reset', { tractor_id: target });
-});
-
-document.getElementById('reset-all').addEventListener('click', () => {
-  resetAssignments();
-  socket.emit('assignments_reset', {});
-});
-
-document.getElementById('save-build').addEventListener('click', buildRoutes);
-
-document.getElementById('download-kml').addEventListener('click', downloadKml);
-
-document.getElementById('auto-assign').addEventListener('click', autoAssign);
-
-document.getElementById('clear-routes').addEventListener('click', clearRoutes);
-
-document.getElementById('apply-settings').addEventListener('click', submitSettings);
-
-Array.from(document.querySelectorAll('input[name="mode"]')).forEach((el) => {
-  el.addEventListener('change', () => {
-    state.mode = el.value;
-    appendLog(`[MODE] Переключено на ${state.mode === 'grid' ? 'сетку' : 'дороги'}`);
-  });
-});
-
-if (advancedToggle) {
-  advancedToggle.addEventListener('change', () => {
-    state.advanced = advancedToggle.checked;
-    appendLog(`[ADVANCED] ${state.advanced ? 'Включено' : 'Отключено'}`);
-  });
-}
-
-Array.from(document.querySelectorAll('input[name="street-source"]')).forEach((el) => {
-  el.addEventListener('change', () => {
-    state.streetSource = el.value;
-    appendLog(`[STREET] Источник улиц: ${state.streetSource}`);
-  });
+window.addEventListener('resize', () => {
+  if (window.innerWidth >= 992) sidebar.classList.remove('open');
 });

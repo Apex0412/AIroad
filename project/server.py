@@ -5,19 +5,29 @@ import os
 import sys
 import threading
 from datetime import datetime
-from pathlib import Path
 from typing import Dict, List
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request, send_file
 from flask_socketio import SocketIO
 
-from route_builder import TRACTOR_COLORS
-from route_builder.grid import (
-    generate_grid,
-    load_geo_boundary,
-    save_grid_geojson,
+from config import (
+    APP_ROOT,
+    ASSIGNMENTS_JSON,
+    DATA_DIR,
+    GEO_PATH,
+    GRID_GEOJSON,
+    ROADS_ASSIGN_JSON,
+    ROADS_COLORED_KML,
+    ROADS_PATH,
+    ROUTES_KML,
+    env_google_key,
+    env_yandex_key,
+    load_settings as config_load_settings,
+    save_settings as config_save_settings,
 )
+from route_builder import TRACTOR_COLORS
+from route_builder.grid import generate_grid, load_geo_boundary, save_grid_geojson
 from route_builder.optimizer import (
     Tractor,
     assign_cells_kmeans,
@@ -27,21 +37,6 @@ from route_builder.optimizer import (
 from route_builder.roads import load_roads
 from utils.validator import validate_geo_kml
 import subprocess
-
-APP_ROOT = Path(__file__).resolve().parent
-DATA_DIR = APP_ROOT / "data"
-CACHE_DIR = APP_ROOT / "cache"
-GRID_PATH = DATA_DIR / "grid.geojson"
-ASSIGNMENTS_PATH = DATA_DIR / "assignments.json"
-ROADS_ASSIGN_PATH = DATA_DIR / "roads_assignment.json"
-ROUTES_KML = DATA_DIR / "routes_grid.kml"
-ROADS_COLORED = DATA_DIR / "roads_colored.kml"
-SETTINGS_PATH = APP_ROOT / "app_settings.json"
-GEO_PATH = DATA_DIR / "GEO.kml"
-ROADS_PATH = DATA_DIR / "RoadCity.kml"
-
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 load_dotenv(APP_ROOT / ".env", override=True)
 
@@ -79,18 +74,14 @@ def load_settings() -> Dict[str, object]:
         "sample_every_m": float(os.getenv("SAMPLE_EVERY_M", "150")),
         "street_source": os.getenv("STREET_SOURCE", "google"),
         "advanced": os.getenv("ADVANCED_OPTIMIZATION", "false").lower() == "true",
-        "mode": os.getenv("USE_GRID_BY_DEFAULT", "true").lower() == "true" and "grid" or "road",
+        "mode": "grid" if os.getenv("USE_GRID_BY_DEFAULT", "true").lower() == "true" else "road",
+        "routing_provider": os.getenv("ROUTING_PROVIDER", "google"),
     }
-    if SETTINGS_PATH.exists():
-        try:
-            defaults.update(json.loads(SETTINGS_PATH.read_text(encoding="utf-8")))
-        except Exception:
-            pass
-    return defaults
+    return config_load_settings(defaults)
 
 
 def save_settings(settings: Dict[str, object]) -> None:
-    SETTINGS_PATH.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    config_save_settings(settings)
 
 
 def tractors_for_settings(settings: Dict[str, object]) -> List[Tractor]:
@@ -121,21 +112,23 @@ def ensure_grid_exists(grid_cells: int, force: bool = False) -> None:
         _emit_log(f"[{_timestamp()}] [GRID ERROR] {_grid_error}")
         return
     try:
-        if GRID_PATH.exists() and not force:
-            data = json.loads(GRID_PATH.read_text(encoding="utf-8"))
+        if GRID_GEOJSON.exists() and not force:
+            data = json.loads(GRID_GEOJSON.read_text(encoding="utf-8"))
             meta = data.get("metadata", {})
             if int(meta.get("grid_cells", grid_cells)) == grid_cells and data.get("features"):
                 _grid_error = None
                 socketio.emit("grid_error", {"message": None})
                 socketio.emit("grid_ready", {"cells": len(data.get("features", []))})
+                socketio.emit("grid_updated", data)
                 return
         _emit_log(f"[{_timestamp()}] [GRID] Читаю GEO.kml и строю сетку на {grid_cells} клеток")
         boundary = load_geo_boundary(GEO_PATH)
         cells = generate_grid(boundary, grid_cells)
-        save_grid_geojson(cells, GRID_PATH, grid_cells)
+        save_grid_geojson(cells, GRID_GEOJSON, grid_cells)
         _grid_error = None
         socketio.emit("grid_error", {"message": None})
         socketio.emit("grid_ready", {"cells": len(cells)})
+        socketio.emit("grid_updated", json.loads(GRID_GEOJSON.read_text(encoding="utf-8")))
         _emit_log(f"[{_timestamp()}] [GRID] Сетка обновлена ({len(cells)} клеток)")
     except Exception as exc:
         _grid_error = str(exc)
@@ -144,10 +137,10 @@ def ensure_grid_exists(grid_cells: int, force: bool = False) -> None:
 
 
 def load_assignments() -> Dict[str, str]:
-    if not ASSIGNMENTS_PATH.exists():
+    if not ASSIGNMENTS_JSON.exists():
         return {}
     try:
-        return json.loads(ASSIGNMENTS_PATH.read_text(encoding="utf-8"))
+        return json.loads(ASSIGNMENTS_JSON.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
@@ -190,8 +183,8 @@ def index():
         "map.html",
         settings=_current_settings,
         grid_error=_grid_error,
-        has_google_key=bool(os.getenv("GOOGLE_MAPS_API_KEY")),
-        has_yandex_key=bool(os.getenv("YANDEX_GEOCODER_API_KEY")),
+        has_google_key=bool(env_google_key()),
+        has_yandex_key=bool(env_yandex_key()),
         tractor_colors=TRACTOR_COLORS,
     )
 
@@ -201,7 +194,7 @@ def grid_geojson():
     ensure_grid_exists(int(_current_settings.get("grid_cells", 64)))
     if _grid_error:
         return jsonify({"error": _grid_error}), 409
-    return jsonify(json.loads(GRID_PATH.read_text(encoding="utf-8")))
+    return jsonify(json.loads(GRID_GEOJSON.read_text(encoding="utf-8")))
 
 
 @app.get("/routes_grid.kml")
@@ -246,6 +239,7 @@ def update_settings():
         "mode": lambda v: v if v in {"grid", "road"} else "grid",
         "advanced": lambda v: bool(v) if isinstance(v, bool) else str(v).lower() == "true",
         "street_source": lambda v: v if v in {"google", "yandex"} else "google",
+        "routing_provider": lambda v: v if v in {"google", "yandex"} else "google",
         "request_pause": float,
         "sample_every_m": float,
     }
@@ -275,9 +269,9 @@ def auto_assign():
     if not tractors:
         return jsonify({"error": "Нет тракторов"}), 400
     if mode == "grid":
-        if not GRID_PATH.exists():
+        if not GRID_GEOJSON.exists():
             ensure_grid_exists(int(_current_settings.get("grid_cells", 64)), force=True)
-        features = json.loads(GRID_PATH.read_text(encoding="utf-8"))
+        features = json.loads(GRID_GEOJSON.read_text(encoding="utf-8"))
         roads_for_cells = None
         if advanced and ROADS_PATH.exists():
             try:
@@ -301,7 +295,7 @@ def auto_assign():
         )
         _assignments.clear()
         _assignments.update(assignments)
-        ASSIGNMENTS_PATH.write_text(json.dumps(assignments, ensure_ascii=False, indent=2), encoding="utf-8")
+        ASSIGNMENTS_JSON.write_text(json.dumps(assignments, ensure_ascii=False, indent=2), encoding="utf-8")
         socketio.emit("assignments", assignments)
         for item in summary:
             _emit_log(
@@ -335,7 +329,7 @@ def auto_assign():
         else:
             assignments, stats = assign_roads_simple(roads, tractors)
             summary = []
-        ROADS_ASSIGN_PATH.write_text(json.dumps(assignments, ensure_ascii=False, indent=2), encoding="utf-8")
+        ROADS_ASSIGN_JSON.write_text(json.dumps(assignments, ensure_ascii=False, indent=2), encoding="utf-8")
         socketio.emit("roads_assignment", assignments)
         _emit_log(
             f"[{_timestamp()}] [ASSIGN] Автораспределение дорог завершено. {sum(stats.values()):.0f} м покрыто"
@@ -350,7 +344,7 @@ def build_routes_endpoint():
         return jsonify({"error": _grid_error}), 400
     if _build_thread and _build_thread.is_alive():
         return jsonify({"error": "Маршрутизация уже запущена"}), 409
-    if not ROADS_ASSIGN_PATH.exists():
+    if not ROADS_ASSIGN_JSON.exists():
         return jsonify({"error": "Нет назначений дорог"}), 400
     socketio.emit("clear_routes", {})
     _emit_log(f"[{_timestamp()}] [ROUTE] Очистка маршрутов и запуск расчёта")
@@ -374,6 +368,7 @@ def _background_build() -> None:
     if not _build_lock.acquire(blocking=False):
         socketio.emit("progress", {"message": "Маршрутизатор уже запущен"})
         return
+    socketio.emit("build_status", {"running": True})
     try:
         _emit_log(f"[{_timestamp()}] [ROUTE] Запуск маршрутизации…")
         args = [
@@ -384,7 +379,7 @@ def _background_build() -> None:
             "--roads",
             str(ROADS_PATH),
             "--roads-assignment",
-            str(ROADS_ASSIGN_PATH),
+            str(ROADS_ASSIGN_JSON),
             "--output",
             str(ROUTES_KML),
             "--grid-cells",
@@ -410,7 +405,9 @@ def _background_build() -> None:
             "--sample-every-m",
             str(_current_settings.get("sample_every_m", 150.0)),
             "--roads-colored",
-            str(ROADS_COLORED),
+            str(ROADS_COLORED_KML),
+            "--provider",
+            str(_current_settings.get("routing_provider", "google")),
         ]
         if bool(_current_settings.get("use_base_as_start", True)):
             args.append("--use-base-start")
@@ -424,6 +421,7 @@ def _background_build() -> None:
         )
         stage_keywords = {
             "чтение": "📘 Загружаю исходные файлы",
+            "кластер": "🔹 Распределяю участки",
             "построение": "🛠 Строю маршруты",
             "экспорт": "💾 Сохраняю результат",
         }
@@ -436,26 +434,31 @@ def _background_build() -> None:
                 continue
             if line.startswith("[ROUTE_STEP]"):
                 payload = line.split("]", 1)[1].strip()
-                parts = {}
-                for chunk in payload.split():
-                    if "=" in chunk:
-                        key, value = chunk.split("=", 1)
-                        parts[key] = value
-                tractor = parts.get("tractor")
-                lat = parts.get("lat")
-                lon = parts.get("lon")
-                if tractor and lat and lon:
-                    socketio.emit(
-                        "route_step",
-                        {
-                            "tractor_id": tractor,
-                            "coords": [[float(lat), float(lon)]],
-                        },
-                    )
+                if "coords=" in payload:
+                    tractor_part, coords_part = payload.split("coords=", 1)
+                    tractor = tractor_part.replace("tractor=", "").strip()
+                    try:
+                        coords = json.loads(coords_part)
+                    except json.JSONDecodeError:
+                        continue
+                    if tractor and isinstance(coords, list):
+                        socketio.emit(
+                            "route_step",
+                            {
+                                "tractor_id": tractor,
+                                "coords": coords,
+                            },
+                        )
                 continue
             if line.startswith("[ROUTE_DONE]"):
                 _emit_log(line)
-                socketio.emit("tractor_done", {})
+                payload = line.split("]", 1)[1].strip()
+                info = {}
+                for chunk in payload.split():
+                    if "=" in chunk:
+                        key, value = chunk.split("=", 1)
+                        info[key] = value
+                socketio.emit("tractor_done", info)
                 continue
             lowered = line.lower()
             for key, msg in stage_keywords.items():
@@ -479,6 +482,7 @@ def _background_build() -> None:
         global _build_thread
         _build_thread = None
         _build_lock.release()
+        socketio.emit("build_status", {"running": False})
 
 
 def _timestamp() -> str:
@@ -490,16 +494,17 @@ def on_connect():
     socketio.emit("settings", {"settings": _current_settings})
     if _assignments:
         socketio.emit("assignments", _assignments)
-    if ROADS_ASSIGN_PATH.exists():
-        socketio.emit("roads_assignment", json.loads(ROADS_ASSIGN_PATH.read_text(encoding="utf-8")))
+    if ROADS_ASSIGN_JSON.exists():
+        socketio.emit("roads_assignment", json.loads(ROADS_ASSIGN_JSON.read_text(encoding="utf-8")))
     if _grid_error:
         socketio.emit("grid_error", {"message": _grid_error})
     else:
         socketio.emit("grid_error", {"message": None})
-        if GRID_PATH.exists():
+        if GRID_GEOJSON.exists():
             try:
-                data = json.loads(GRID_PATH.read_text(encoding="utf-8"))
+                data = json.loads(GRID_GEOJSON.read_text(encoding="utf-8"))
                 socketio.emit("grid_ready", {"cells": len(data.get("features", []))})
+                socketio.emit("grid_updated", data)
             except Exception:
                 pass
 
@@ -511,7 +516,7 @@ def on_assign_sector(payload):
     if not sector_id or not tractor_id:
         return
     _assignments[sector_id] = tractor_id
-    ASSIGNMENTS_PATH.write_text(json.dumps(_assignments, ensure_ascii=False, indent=2), encoding="utf-8")
+    ASSIGNMENTS_JSON.write_text(json.dumps(_assignments, ensure_ascii=False, indent=2), encoding="utf-8")
     socketio.emit("assignments", _assignments)
 
 
@@ -524,7 +529,7 @@ def on_assignments_reset(payload):
         _assignments.update(remaining)
     else:
         _assignments.clear()
-    ASSIGNMENTS_PATH.write_text(json.dumps(_assignments, ensure_ascii=False, indent=2), encoding="utf-8")
+    ASSIGNMENTS_JSON.write_text(json.dumps(_assignments, ensure_ascii=False, indent=2), encoding="utf-8")
     socketio.emit("assignments", _assignments)
 
 

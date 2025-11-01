@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-pause", type=float, default=0.35)
     parser.add_argument("--sample-every-m", type=float, default=150.0)
     parser.add_argument("--roads-colored", default=None)
+    parser.add_argument("--provider", default="google")
     return parser.parse_args()
 
 
@@ -82,14 +83,15 @@ def main() -> None:
         base_lat=args.base_lat,
         base_lon=args.base_lon,
         target_km=args.target_km,
+        provider=args.provider,
     )
 
     def progress_cb(message: str) -> None:
         print(message, flush=True)
 
     def route_step_cb(tractor_id: str, coords):
-        for lat, lon in coords:
-            print(f"[ROUTE_STEP] tractor={tractor_id} lat={lat} lon={lon}", flush=True)
+        payload = json.dumps(coords)
+        print(f"[ROUTE_STEP] tractor={tractor_id} coords={payload}", flush=True)
 
     def route_done_cb(tractor_id: str, total_length: float):
         print(f"[ROUTE_DONE] tractor={tractor_id} length={total_length:.2f}", flush=True)
