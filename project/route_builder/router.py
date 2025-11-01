@@ -53,7 +53,7 @@ def build_routes(
         if not lines:
             continue
         if progress_cb:
-            progress_cb(f"[Маршрутизатор] {tractor.name}: получено {len(lines)} линий")
+            progress_cb(f"[STATUS] {tractor.name}: получено {len(lines)} линий")
         current_point = (settings.base_lat, settings.base_lon)
         if not settings.use_base_start:
             first = min(lines, key=lambda r: _haversine(current_point, (r.geometry.coords[0][1], r.geometry.coords[0][0])))
@@ -65,6 +65,10 @@ def build_routes(
                 (line for line in lines if line.id not in visited),
                 key=lambda line: _haversine(current_point, (line.geometry.coords[0][1], line.geometry.coords[0][0])),
             )
+            if progress_cb:
+                progress_cb(
+                    f"[STATUS] {tractor.name}: беру {next_line.name or next_line.id}"
+                )
             start = (next_line.geometry.coords[0][1], next_line.geometry.coords[0][0])
             if current_point != start:
                 leg = _fetch_directions(
@@ -87,6 +91,8 @@ def build_routes(
             visited.add(next_line.id)
         if route_done_cb:
             route_done_cb(tractor.id, total_length)
+        if progress_cb:
+            progress_cb(f"[STATUS] {tractor.name}: маршрут готов ({total_length:.2f} км)")
     return routes
 
 

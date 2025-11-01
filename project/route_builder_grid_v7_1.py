@@ -66,7 +66,7 @@ def main() -> None:
     assignment_path = Path(args.roads_assignment)
     output_path = Path(args.output)
 
-    print("Чтение входных файлов…", flush=True)
+    print("[STATUS] Чтение входных файлов", flush=True)
     boundary = load_geo_boundary(geo_path)
     roads = load_roads(roads_path, boundary=boundary)
     assignments = load_assignments(assignment_path)
@@ -94,8 +94,8 @@ def main() -> None:
     def route_done_cb(tractor_id: str, total_length: float):
         print(f"[ROUTE_DONE] tractor={tractor_id} length={total_length:.2f}", flush=True)
 
-    print("Кластеризация дорожных сегментов…", flush=True)
-    print("Построение маршрутов…", flush=True)
+    print("[STATUS] Кластеризация дорожных сегментов", flush=True)
+    print("[STATUS] Построение маршрутов", flush=True)
     routes = build_routes(
         roads,
         assignments,
@@ -106,11 +106,11 @@ def main() -> None:
         route_done_cb=route_done_cb,
     )
 
-    print("Экспорт в KML…", flush=True)
+    print("[STATUS] Экспорт в KML", flush=True)
     export_routes_kml(routes, tractors, output_path)
     if args.roads_colored:
         export_roads_kml(assignments, roads, tractors, Path(args.roads_colored))
-    print("Готово", flush=True)
+    print("[STATUS] Маршрутизация завершена", flush=True)
 
 
 if __name__ == "__main__":

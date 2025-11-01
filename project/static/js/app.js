@@ -91,7 +91,11 @@ function resetAssignments() {
 function loadGrid() {
   fetch('/grid')
     .then((res) => {
-      if (!res.ok) throw new Error('Ошибка загрузки сетки');
+      if (!res.ok) {
+        return res.json().then((data) => {
+          throw new Error(data.error || 'Ошибка загрузки сетки');
+        });
+      }
       return res.json();
     })
     .then((data) => {
@@ -182,6 +186,11 @@ function autoAssign() {
     .then((data) => {
       if (data.error) throw new Error(data.error);
       appendLog(`Автораспределение завершено (${data.assigned})`);
+      if (Array.isArray(data.summary)) {
+        data.summary.forEach((item) => {
+          appendLog(`${item.tractor}: ${item.cells} клеток, ${item.area_km2.toFixed(2)} км², дорог ${Math.round(item.roads_m)} м`);
+        });
+      }
     })
     .catch((err) => appendLog(`Ошибка автораспределения: ${err.message}`));
 }
@@ -198,6 +207,16 @@ function buildRoutes() {
 
 function downloadKml() {
   window.open('/routes_grid.kml', '_blank');
+}
+
+function clearRoutes() {
+  fetch('/clear_routes', { method: 'POST' })
+    .then((res) => res.json())
+    .then((data) => {
+      if (data.error) throw new Error(data.error);
+      appendLog('Маршруты очищены');
+    })
+    .catch((err) => appendLog(`Ошибка очистки маршрутов: ${err.message}`));
 }
 
 socket.on('settings', (payload) => {
@@ -285,6 +304,10 @@ socket.on('routes_ready', () => {
 });
 
 socket.on('grid_error', (payload) => {
+  if (!payload || !payload.message) {
+    appendLog('Сетка готова к работе');
+    return;
+  }
   appendLog(`Ошибка сетки: ${payload.message}`);
 });
 
@@ -318,6 +341,8 @@ document.getElementById('save-build').addEventListener('click', buildRoutes);
 document.getElementById('download-kml').addEventListener('click', downloadKml);
 
 document.getElementById('auto-assign').addEventListener('click', autoAssign);
+
+document.getElementById('clear-routes').addEventListener('click', clearRoutes);
 
 document.getElementById('apply-settings').addEventListener('click', submitSettings);
 

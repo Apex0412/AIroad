@@ -5,8 +5,9 @@ import json
 import math
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Sequence, Tuple
 
+from lxml import etree
 from shapely.geometry import MultiPolygon, Polygon, box, shape
 from shapely.ops import unary_union
 
@@ -23,35 +24,13 @@ def load_geo_boundary(path: Path) -> MultiPolygon:
     if not path.exists():
         raise FileNotFoundError(f"Граничный файл не найден: {path}")
 
-    text = path.read_text(encoding="utf-8")
-    if "<kml" in text[:256].lower():
-        from lxml import etree
+    raw = path.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    text = raw.decode("utf-8", errors="replace")
 
-        tree = etree.fromstring(text.encode("utf-8"))
-        nsmap = tree.nsmap.copy()
-        nsmap.setdefault(None, "http://www.opengis.net/kml/2.2")
-        polygons: List[Polygon] = []
-        for polygon in tree.findall(
-            ".//{http://www.opengis.net/kml/2.2}Polygon"
-        ):
-            coords_text = polygon.findtext(
-                ".//{http://www.opengis.net/kml/2.2}coordinates"
-            )
-            if not coords_text:
-                continue
-            ring = [
-                tuple(map(float, part.split(",")[:2]))
-                for part in coords_text.strip().split()
-            ]
-            if len(ring) < 3:
-                continue
-            polygons.append(Polygon([(lon, lat) for lon, lat in ring]))
-        if not polygons:
-            raise ValueError("Не удалось извлечь полигоны из GEO.kml")
-        mp = unary_union(polygons)
-        if isinstance(mp, Polygon):
-            return MultiPolygon([mp])
-        return MultiPolygon(mp.geoms)
+    if "<kml" in text[:1024].lower():
+        return _load_kml_boundary(text)
 
     data = json.loads(text)
     geom = shape(data["features"][0]["geometry"])
@@ -60,6 +39,105 @@ def load_geo_boundary(path: Path) -> MultiPolygon:
     if isinstance(geom, MultiPolygon):
         return geom
     raise ValueError("Неподдерживаемый тип геометрии для границы города")
+
+
+def _load_kml_boundary(text: str) -> MultiPolygon:
+    parser = etree.XMLParser(remove_blank_text=True, recover=True)
+    root = etree.fromstring(text.encode("utf-8"), parser=parser)
+
+    polygons: List[Polygon] = []
+
+    for polygon_elem in root.findall(".//{*}Polygon"):
+        poly = _polygon_from_element(polygon_elem)
+        if poly is not None and not poly.is_empty:
+            polygons.append(poly)
+
+    if not polygons:
+        for ring_elem in root.findall(".//{*}LinearRing"):
+            coords = _coords_from_element(ring_elem)
+            if len(coords) >= 4:
+                poly = Polygon(coords)
+                if not poly.is_empty:
+                    polygons.append(_ensure_valid(poly))
+
+    if not polygons:
+        for line_elem in root.findall(".//{*}LineString"):
+            coords = _coords_from_element(line_elem)
+            if len(coords) >= 4 and coords[0] == coords[-1]:
+                poly = Polygon(coords)
+                if not poly.is_empty:
+                    polygons.append(_ensure_valid(poly))
+
+    if not polygons:
+        tags = sorted({etree.QName(elem).localname for elem in root.iter()})
+        snippet = text[:200].replace("\n", " ").strip()
+        raise ValueError(
+            "Не удалось извлечь полигоны из GEO.kml. "
+            f"Найдены теги: {', '.join(tags[:20])}. Фрагмент: {snippet}"
+        )
+
+    union = unary_union(polygons)
+    if isinstance(union, Polygon):
+        union = MultiPolygon([_ensure_valid(union)])
+    elif isinstance(union, MultiPolygon):
+        union = MultiPolygon([_ensure_valid(poly) for poly in union.geoms])
+    else:
+        geoms = [geom for geom in getattr(union, "geoms", []) if isinstance(geom, Polygon)]
+        if not geoms:
+            raise ValueError("Граница после объединения не содержит полигонов")
+        union = MultiPolygon([_ensure_valid(poly) for poly in geoms])
+    return union
+
+
+def _polygon_from_element(element: etree._Element) -> Polygon | None:
+    outer = element.find(".//{*}outerBoundaryIs/{*}LinearRing")
+    coords = _coords_from_element(outer) if outer is not None else _coords_from_element(element)
+    if len(coords) < 4:
+        return None
+    holes: List[Sequence[Tuple[float, float]]] = []
+    for inner in element.findall(".//{*}innerBoundaryIs/{*}LinearRing"):
+        interior = _coords_from_element(inner)
+        if len(interior) >= 4:
+            holes.append(interior)
+    polygon = Polygon(coords, holes or None)
+    if polygon.is_empty:
+        return None
+    return _ensure_valid(polygon)
+
+
+def _coords_from_element(element: etree._Element) -> List[Tuple[float, float]]:
+    if element is None:
+        return []
+    text = element.findtext(".//{*}coordinates") or ""
+    if not text.strip():
+        text = element.text or ""
+    coords: List[Tuple[float, float]] = []
+    for chunk in text.replace("\n", " ").replace("\t", " ").split():
+        parts = chunk.split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            lon = float(parts[0])
+            lat = float(parts[1])
+        except ValueError:
+            continue
+        coords.append((lon, lat))
+    if coords and coords[0] != coords[-1]:
+        coords.append(coords[0])
+    return coords
+
+
+def _ensure_valid(polygon: Polygon) -> Polygon:
+    if polygon.is_valid:
+        return polygon
+    fixed = polygon.buffer(0)
+    if isinstance(fixed, Polygon):
+        return fixed
+    if isinstance(fixed, MultiPolygon):
+        areas = list(fixed.geoms)
+        areas.sort(key=lambda p: p.area, reverse=True)
+        return areas[0]
+    return polygon
 
 
 def _grid_dimensions(target_cells: int) -> Tuple[int, int]:

@@ -1,14 +1,16 @@
 """Assignment heuristics for cells and road segments."""
 from __future__ import annotations
 
+import heapq
 import math
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, MultiLineString, Point, Polygon, shape
 from shapely.ops import linemerge
+from shapely.strtree import STRtree
 
 from . import geocoder
 from .roads import Road
@@ -22,71 +24,231 @@ class Tractor:
     base: Tuple[float, float]
 
 
+@dataclass
+class _Cell:
+    id: str
+    polygon: Polygon
+    centroid: Point
+    label: int
+    weight: float
+    area_km2: float
+    road_m: float
+
+
+EARTH_KM_PER_DEG = 111.139
+EARTH_M_PER_DEG = 111_139.0
+
+
 def assign_cells_kmeans(
-    features: Iterable[dict], tractors: List[Tractor]
-) -> Dict[str, str]:
-    """Cluster cell centroids and map to tractors."""
-    coords = []
-    cell_ids = []
+    features: Iterable[dict],
+    tractors: Sequence[Tractor],
+    advanced: bool = False,
+    roads: Optional[Sequence[Road]] = None,
+) -> Tuple[Dict[str, str], List[Dict[str, float]]]:
+    """Cluster cells into contiguous districts and map to tractors."""
+
+    cells: List[_Cell] = []
     for feature in features:
-        geom = feature["geometry"]
-        if geom["type"] == "Polygon":
-            xs, ys = zip(*geom["coordinates"][0])
-        elif geom["type"] == "MultiPolygon":
-            xs, ys = zip(*geom["coordinates"][0][0])
-        else:
+        geom = shape(feature.get("geometry"))
+        if geom.is_empty:
             continue
-        lon = float(np.mean(xs))
-        lat = float(np.mean(ys))
-        coords.append([lon, lat])
-        cell_ids.append(feature["properties"]["id"])
-    if not coords:
-        return {}
-    X = np.array(coords)
-    n_clusters = min(len(tractors), len(X))
+        if isinstance(geom, Polygon):
+            polygon = geom
+        else:
+            # take the largest polygon part
+            polygon = max(geom.geoms, key=lambda g: g.area)
+        centroid = polygon.centroid
+        area_km2 = polygon.area * (EARTH_KM_PER_DEG ** 2)
+        road_m = 0.0
+        cell = _Cell(
+            id=str(feature.get("properties", {}).get("id")),
+            polygon=polygon,
+            centroid=centroid,
+            label=0,
+            weight=max(area_km2 * 1000.0, 1.0),
+            area_km2=area_km2,
+            road_m=road_m,
+        )
+        cells.append(cell)
+
+    cells = [cell for cell in cells if cell.id]
+    if not cells or not tractors:
+        return {}, []
+
+    if advanced and roads:
+        _assign_road_weights(cells, roads)
+
+    coords = np.array([[cell.centroid.x, cell.centroid.y] for cell in cells])
+    n_clusters = min(len(tractors), len(coords))
     from sklearn.cluster import KMeans
 
     kmeans = KMeans(n_clusters=n_clusters, n_init="auto", random_state=42)
-    labels = kmeans.fit_predict(X)
-    assignments = {}
-    for idx, cell_id in enumerate(cell_ids):
-        tractor = tractors[labels[idx] % len(tractors)]
-        assignments[cell_id] = tractor.id
-    return _smooth_assignments(assignments, features)
+    labels = kmeans.fit_predict(coords)
+    centers = kmeans.cluster_centers_
 
+    for cell, label in zip(cells, labels):
+        cell.label = int(label)
 
-def _smooth_assignments(assignments: Dict[str, str], features: Iterable[dict]) -> Dict[str, str]:
-    adjacency: Dict[str, List[str]] = defaultdict(list)
-    id_to_geom: Dict[str, Polygon] = {}
-    for feature in features:
-        geom = feature["geometry"]
-        polygon = Polygon(geom["coordinates"][0])
-        sid = feature["properties"]["id"]
-        id_to_geom[sid] = polygon
-    ids = list(id_to_geom.keys())
-    for i, sid in enumerate(ids):
-        for other in ids[i + 1 :]:
-            if id_to_geom[sid].touches(id_to_geom[other]):
-                adjacency[sid].append(other)
-                adjacency[other].append(sid)
-    visited = set()
-    smoothed = assignments.copy()
-    for sid in ids:
-        if sid in visited:
+    adjacency = _build_adjacency(cells)
+    cell_by_id = {cell.id: cell for cell in cells}
+
+    active_tractors = list(tractors[:n_clusters])
+    cluster_to_tractor = {idx: active_tractors[idx] for idx in range(len(active_tractors))}
+
+    assignments: Dict[str, str] = {}
+    weights = {tractor.id: 0.0 for tractor in active_tractors}
+    total_weight = sum(cell.weight for cell in cells)
+    target_weight = total_weight / max(len(active_tractors), 1)
+
+    available = {cell.id for cell in cells}
+    queue: List[Tuple[float, int, str]] = []
+
+    for idx, tractor in cluster_to_tractor.items():
+        cluster_cells = [cell for cell in cells if cell.label == idx]
+        if not cluster_cells:
             continue
-        cluster = []
-        queue = deque([sid])
-        while queue:
-            cid = queue.popleft()
-            if cid in visited:
+        center = centers[idx]
+        seed = min(
+            cluster_cells,
+            key=lambda c: _distance((c.centroid.x, c.centroid.y), center),
+        )
+        assignments[seed.id] = tractor.id
+        weights[tractor.id] += seed.weight
+        available.discard(seed.id)
+        for neighbor in adjacency.get(seed.id, []):
+            if neighbor in available:
+                penalty = 0.0
+                queue.append(
+                    (
+                        _distance(
+                            (cell_by_id[neighbor].centroid.x, cell_by_id[neighbor].centroid.y),
+                            center,
+                        ),
+                        idx,
+                        neighbor,
+                    )
+                )
+
+    heapq.heapify(queue)
+
+    while available:
+        if not queue:
+            # fallback: grab nearest cell to any center
+            fallback_cell_id = min(
+                available,
+                key=lambda cid: min(
+                    _distance(
+                        (cell_by_id[cid].centroid.x, cell_by_id[cid].centroid.y),
+                        centers[idx],
+                    )
+                    for idx in cluster_to_tractor
+                ),
+            )
+            best_cluster = min(
+                cluster_to_tractor,
+                key=lambda idx: _distance(
+                    (cell_by_id[fallback_cell_id].centroid.x, cell_by_id[fallback_cell_id].centroid.y),
+                    centers[idx],
+                ),
+            )
+            queue.append((0.0, best_cluster, fallback_cell_id))
+            heapq.heapify(queue)
+            continue
+
+        priority, cluster_idx, cell_id = heapq.heappop(queue)
+        if cell_id not in available:
+            continue
+        tractor = cluster_to_tractor.get(cluster_idx)
+        if tractor is None:
+            tractor = active_tractors[cluster_idx % len(active_tractors)]
+        cell = cell_by_id[cell_id]
+
+        projected = weights[tractor.id] + cell.weight
+        if projected > target_weight * 1.15 and any(
+            weights[other.id] < target_weight * 0.9 for other in active_tractors
+        ):
+            heapq.heappush(queue, (priority + 5.0, cluster_idx, cell_id))
+            continue
+
+        assignments[cell_id] = tractor.id
+        weights[tractor.id] = projected
+        available.remove(cell_id)
+
+        for neighbor in adjacency.get(cell_id, []):
+            if neighbor not in available:
                 continue
-            visited.add(cid)
-            cluster.append(cid)
-            for neigh in adjacency[cid]:
-                if assignments.get(neigh) == assignments.get(cid):
-                    queue.append(neigh)
-        # nothing else to do currently, placeholder for smoothing
-    return smoothed
+            neighbor_cell = cell_by_id[neighbor]
+            penalty = 0.0 if neighbor_cell.label == cluster_idx else 2.0
+            if advanced:
+                projected_neighbor = weights[tractor.id] + neighbor_cell.weight
+                if projected_neighbor > target_weight:
+                    penalty += (projected_neighbor - target_weight) / max(target_weight, 1.0)
+            heapq.heappush(
+                queue,
+                (
+                    _distance(
+                        (neighbor_cell.centroid.x, neighbor_cell.centroid.y),
+                        centers[cluster_idx],
+                    )
+                    + penalty,
+                    cluster_idx,
+                    neighbor,
+                ),
+            )
+
+    summary: List[Dict[str, float]] = []
+    for tractor in tractors:
+        ids = [cid for cid, tid in assignments.items() if tid == tractor.id]
+        area_km2 = sum(cell_by_id[cid].area_km2 for cid in ids if cid in cell_by_id)
+        road_m = sum(cell_by_id[cid].road_m for cid in ids if cid in cell_by_id)
+        summary.append(
+            {
+                "tractor": tractor.name,
+                "cells": len(ids),
+                "area_km2": area_km2,
+                "roads_m": road_m,
+            }
+        )
+
+    return assignments, summary
+
+
+def _assign_road_weights(cells: Sequence[_Cell], roads: Sequence[Road]) -> None:
+    geometries = [road.geometry for road in roads]
+    if not geometries:
+        return
+    tree = STRtree(geometries)
+    geom_to_road = {id(geom): road for geom, road in zip(geometries, roads)}
+
+    for cell in cells:
+        total_len = 0.0
+        for candidate in tree.query(cell.polygon):
+            road = geom_to_road[id(candidate)]
+            inter = candidate.intersection(cell.polygon)
+            if inter.is_empty:
+                continue
+            if isinstance(inter, LineString):
+                total_len += inter.length
+            elif isinstance(inter, MultiLineString):
+                total_len += sum(part.length for part in inter.geoms)
+        length_m = total_len * EARTH_M_PER_DEG
+        if length_m > 0:
+            cell.weight = max(length_m, cell.weight)
+            cell.road_m = length_m
+
+
+def _build_adjacency(cells: Sequence[_Cell]) -> Dict[str, List[str]]:
+    adjacency: Dict[str, List[str]] = defaultdict(list)
+    for idx, cell in enumerate(cells):
+        for other in cells[idx + 1 :]:
+            if cell.polygon.touches(other.polygon):
+                adjacency[cell.id].append(other.id)
+                adjacency[other.id].append(cell.id)
+    return adjacency
+
+
+def _distance(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
 def assign_roads_simple(roads: List[Road], tractors: List[Tractor]) -> Tuple[Dict[str, str], Dict[str, float]]:
