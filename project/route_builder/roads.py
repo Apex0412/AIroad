@@ -1,16 +1,14 @@
 """Road ingestion and preprocessing utilities."""
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, Iterator, List, Optional, Tuple
 
+from lxml import etree
 from shapely.geometry import LineString, MultiLineString, Point
 from shapely.ops import linemerge, split
 from shapely.strtree import STRtree
-
-LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -20,24 +18,38 @@ class Road:
     geometry: LineString
 
 
-def _iter_kml_lines(path: Path) -> Iterable[tuple[str, Optional[str], LineString]]:
-    from lxml import etree
+def _iter_kml_lines(path: Path) -> Iterator[tuple[str | None, LineString]]:
+    """Yield road segments from a KML file regardless of nesting."""
 
-    root = etree.fromstring(path.read_bytes())
-    ns = {"k": "http://www.opengis.net/kml/2.2"}
-    for placemark in root.findall(".//k:Placemark", ns):
-        name = placemark.findtext("k:name", namespaces=ns)
-        for linestring in placemark.findall(".//k:LineString", ns):
-            coords_text = linestring.findtext("k:coordinates", namespaces=ns)
-            if not coords_text:
-                continue
-            coords = []
-            for part in coords_text.replace("\n", " ").split():
-                lon, lat = map(float, part.split(",")[:2])
-                coords.append((lon, lat))
+    parser = etree.XMLParser(remove_blank_text=True, recover=True)
+    root = etree.fromstring(path.read_bytes(), parser=parser)
+
+    for placemark in root.findall(".//{*}Placemark"):
+        name = placemark.findtext(".//{*}name")
+        for linestring in placemark.findall(".//{*}LineString"):
+            coords = _coords_from_element(linestring)
             if len(coords) < 2:
                 continue
-            yield (name or None, LineString(coords))
+            try:
+                yield (name or None, LineString(coords))
+            except ValueError:
+                continue
+
+
+def _coords_from_element(element: etree._Element) -> List[Tuple[float, float]]:
+    text = element.findtext(".//{*}coordinates") or element.text or ""
+    coords: List[Tuple[float, float]] = []
+    for chunk in text.replace("\n", " ").replace("\t", " ").split():
+        parts = chunk.split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            lon = float(parts[0])
+            lat = float(parts[1])
+        except ValueError:
+            continue
+        coords.append((lon, lat))
+    return coords
 
 
 def load_roads(path: Path, boundary=None) -> List[Road]:

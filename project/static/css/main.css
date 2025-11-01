@@ -32,8 +32,8 @@ body.theme-dark {
 }
 
 .sidebar {
-  width: 360px;
-  max-width: 90vw;
+  width: 440px;
+  max-width: 95vw;
   background: var(--sidebar-light);
   color: var(--text-light);
   box-shadow: 0 0 24px rgba(15, 23, 42, 0.12);
@@ -42,6 +42,7 @@ body.theme-dark {
   flex-direction: column;
   gap: 20px;
   position: relative;
+  height: 100vh;
   transition: background 0.3s ease, color 0.3s ease, transform 0.3s ease;
   overflow-y: auto;
   overflow-x: hidden;
@@ -239,6 +240,25 @@ body.theme-dark .sidebar {
   font-weight: 600;
   cursor: pointer;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.btn.loading {
+  position: relative;
+  pointer-events: none;
+}
+
+.btn.loading::after {
+  content: '';
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: rgba(255, 255, 255, 0.95);
+  animation: spin 0.75s linear infinite;
 }
 
 .btn:hover {
@@ -301,16 +321,17 @@ body.theme-dark .sidebar {
 }
 
 .log {
-  background: rgba(15, 23, 42, 0.07);
+  background: #0b1220;
+  color: #cbd5e1;
   border-radius: 12px;
-  padding: 12px;
-  height: 220px;
+  padding: 14px;
+  height: 240px;
   overflow-y: auto;
-  font-size: 0.85rem;
+  font-size: 0.82rem;
 }
 
 body.theme-dark .log {
-  background: rgba(148, 163, 184, 0.12);
+  background: rgba(15, 23, 42, 0.6);
 }
 
 .log-entry {

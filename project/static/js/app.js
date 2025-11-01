@@ -77,6 +77,13 @@ function showToast(message, kind = 'info', timeout = 4000) {
   setTimeout(() => toast.remove(), timeout);
 }
 
+function setBusy(selector, busy) {
+  const el = typeof selector === 'string' ? document.querySelector(selector) : selector;
+  if (!el) return;
+  el.disabled = busy;
+  el.classList.toggle('loading', busy);
+}
+
 function setSpinner(active) {
   state.building = active;
   buildSpinner.hidden = !active;
@@ -228,6 +235,9 @@ function renderGrid(data) {
       sectorLayers.set(id, layer);
     },
   }).addTo(map);
+  if (Array.isArray(data.features)) {
+    gridMeta.textContent = `Сетка: ${data.features.length}`;
+  }
   if (gridLayer.getBounds().isValid()) {
     map.fitBounds(gridLayer.getBounds(), { padding: [20, 20] });
   }
@@ -252,6 +262,8 @@ function fetchGrid() {
     });
 }
 
+let roadsFetched = false;
+
 function loadRoadsLayer({ silent = false } = {}) {
   if (!silent) setMapSpinner(true);
   fetch('/roads')
@@ -272,6 +284,11 @@ function loadRoadsLayer({ silent = false } = {}) {
       if (roadsLayer.getBounds().isValid() && state.mode === 'road') {
         map.fitBounds(roadsLayer.getBounds(), { padding: [20, 20] });
       }
+      if (!silent) {
+        const total = data.features.reduce((acc, feature) => acc + (feature.properties.length_m || 0), 0);
+        appendLog(`[ROADS] Загрузил ${data.features.length} линий, всего ${(total / 1000).toFixed(1)} км`);
+      }
+      roadsFetched = true;
       if (!silent) setMapSpinner(false);
     })
     .catch(() => {
@@ -290,7 +307,12 @@ function setMode(newMode) {
     fetchGrid();
   } else {
     if (gridLayer) gridLayer.remove();
-    loadRoadsLayer();
+    if (roadsFetched) {
+      loadRoadsLayer({ silent: true });
+      setMapSpinner(false);
+    } else {
+      loadRoadsLayer();
+    }
   }
 }
 
@@ -311,6 +333,7 @@ function submitSettings() {
     street_source: state.streetSource,
     routing_provider: state.provider,
   };
+  setBusy('#apply-settings', true);
   fetch('/settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -322,33 +345,40 @@ function submitSettings() {
       appendLog('[SETTINGS] Настройки обновлены');
       loadGridFromSettings();
       buildTractors();
+      showToast('Настройки сохранены', 'success');
     })
-    .catch((err) => appendLog(`[SETTINGS ERROR] ${err.message}`));
+    .catch((err) => {
+      appendLog(`[SETTINGS ERROR] ${err.message}`);
+      showToast(err.message, 'error');
+    })
+    .finally(() => setBusy('#apply-settings', false));
 }
 
 function autoAssign() {
-  const params = new URLSearchParams({
-    mode: state.mode,
-    advanced: state.advanced,
-    streetSource: state.streetSource,
-  });
-  fetch(`/auto_assign?${params.toString()}`, { method: 'POST' })
+  setBusy('#auto-assign', true);
+  appendLog('[ASSIGN] Запускаю автораспределение…');
+  fetch('/auto_assign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      mode: state.mode,
+      advanced: state.advanced,
+      streetSource: state.streetSource,
+    }),
+  })
     .then((res) => res.json())
     .then((data) => {
-      if (data.error) throw new Error(data.error);
-      appendLog(`🔀 Автораспределение завершено (${data.assigned})`);
-      if (Array.isArray(data.summary)) {
-        data.summary.forEach((item) => {
-          const roads = Math.round(item.roads_m || 0);
-          appendLog(`[ASSIGN] ${item.tractor}: ${item.cells} клеток, ${item.area_km2.toFixed(2)} км², дорог ${roads} м`);
-        });
+      if (!data.success) {
+        throw new Error(data.error || 'Автораспределение не выполнено');
       }
-      showToast('Автораспределение выполнено', 'success');
+      appendLog(`🔀 Автораспределение завершено (${data.assigned})`);
+      showToast('Назначения обновлены', 'success');
     })
     .catch((err) => {
       appendLog(`[ASSIGN ERROR] ${err.message}`);
       showToast(err.message, 'error');
-    });
+    })
+    .finally(() => setBusy('#auto-assign', false));
 }
 
 function buildRoutes() {
@@ -431,6 +461,7 @@ Array.from(document.querySelectorAll('input[name="street-source"]')).forEach((el
   el.addEventListener('change', () => {
     state.streetSource = el.value;
     appendLog(`[STREET] Источник улиц: ${state.streetSource}`);
+    showToast(`Источник улиц: ${state.streetSource === 'google' ? 'Google' : 'Yandex'}`, 'info');
   });
 });
 
@@ -446,6 +477,7 @@ if (advancedToggle) {
   advancedToggle.addEventListener('change', () => {
     state.advanced = advancedToggle.checked;
     appendLog(`[ADVANCED] ${state.advanced ? 'Включено' : 'Отключено'}`);
+    showToast(state.advanced ? 'Advanced optimization включена' : 'Advanced optimization отключена', 'info');
   });
 }
 
@@ -453,7 +485,6 @@ function handleLogEvent(data) {
   if (data && data.message) appendLog(data.message);
 }
 
-socket.on('progress', handleLogEvent);
 socket.on('log', handleLogEvent);
 
 socket.on('grid_ready', (data) => {
@@ -476,6 +507,9 @@ socket.on('grid_error', (payload) => {
 socket.on('grid_updated', (data) => {
   if (state.mode === 'grid') {
     renderGrid(data);
+  }
+  if (Array.isArray(data.features)) {
+    gridMeta.textContent = `Сетка: ${data.features.length}`;
   }
 });
 
@@ -507,10 +541,17 @@ socket.on('settings', (payload) => {
   }
 });
 
-socket.on('assignments', (data) => {
+socket.on('assignments_updated', (payload) => {
+  if (!payload || !payload.assignments) return;
   resetAssignments();
-  Object.entries(data).forEach(([sectorId, tractorId]) => applyAssignment(sectorId, tractorId));
+  Object.entries(payload.assignments).forEach(([sectorId, tractorId]) => applyAssignment(sectorId, tractorId));
   appendLog('[ASSIGN] Назначения обновлены');
+  if (Array.isArray(payload.summary)) {
+    payload.summary.forEach((item) => {
+      const roads = Math.round(item.roads_m || 0);
+      appendLog(`[ASSIGN] ${item.tractor}: ${item.cells} клеток, ${item.area_km2.toFixed(2)} км², дорог ${roads} м`);
+    });
+  }
 });
 
 socket.on('roads_assignment', (data) => {
@@ -526,7 +567,7 @@ socket.on('roads_assignment', (data) => {
 });
 
 socket.on('route_step', (data) => {
-  const { tractor_id: tractorId, coords } = data;
+  const { tractor_id: tractorId, polyline } = data;
   if (!routeLayers.has(tractorId)) {
     const tractor = getTractorById(tractorId);
     routeLayers.set(tractorId, L.polyline([], {
@@ -535,7 +576,7 @@ socket.on('route_step', (data) => {
     }).addTo(map));
   }
   const layer = routeLayers.get(tractorId);
-  coords.forEach(([lat, lon]) => layer.addLatLng([lat, lon]));
+  (polyline || []).forEach(([lat, lon]) => layer.addLatLng([lat, lon]));
 });
 
 socket.on('tractor_done', (info) => {

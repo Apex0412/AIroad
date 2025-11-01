@@ -53,8 +53,8 @@ _roads_cache: dict | None = None
 
 
 def _emit_log(message: str) -> None:
+    app.logger.info(message)
     payload = {"message": message}
-    socketio.emit("progress", payload)
     socketio.emit("log", payload)
 
 
@@ -99,7 +99,7 @@ def tractors_for_settings(settings: Dict[str, object]) -> List[Tractor]:
 
 
 def ensure_grid_exists(grid_cells: int, force: bool = False) -> None:
-    global _grid_error
+    global _grid_error, _roads_cache
     if not GEO_PATH.exists():
         _grid_error = "Отсутствует GEO.kml в директории data/"
         socketio.emit("grid_error", {"message": _grid_error})
@@ -125,6 +125,7 @@ def ensure_grid_exists(grid_cells: int, force: bool = False) -> None:
         boundary = load_geo_boundary(GEO_PATH)
         cells = generate_grid(boundary, grid_cells)
         save_grid_geojson(cells, GRID_GEOJSON, grid_cells)
+        _roads_cache = None
         _grid_error = None
         socketio.emit("grid_error", {"message": None})
         socketio.emit("grid_ready", {"cells": len(cells)})
@@ -140,7 +141,11 @@ def load_assignments() -> Dict[str, str]:
     if not ASSIGNMENTS_JSON.exists():
         return {}
     try:
-        return json.loads(ASSIGNMENTS_JSON.read_text(encoding="utf-8"))
+        payload = json.loads(ASSIGNMENTS_JSON.read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and "assignments" in payload:
+            return dict(payload.get("assignments") or {})
+        if isinstance(payload, dict):
+            return payload
     except Exception:
         return {}
 
@@ -160,7 +165,7 @@ def _ensure_roads_geojson():
         return None
     total_len = sum(road.geometry.length for road in roads) * 111_139
     _emit_log(
-        f"[{_timestamp()}] [ROADS] Найдено {len(roads)} линий, общая длина {total_len/1000:.1f} км"
+        f"[{_timestamp()}] [ROADS] Загрузил {len(roads)} линий, суммарно {total_len/1000:.1f} км"
     )
     features = []
     for road in roads:
@@ -169,7 +174,11 @@ def _ensure_roads_geojson():
             {
                 "type": "Feature",
                 "geometry": {"type": "LineString", "coordinates": coords},
-                "properties": {"id": road.id, "name": road.name},
+                "properties": {
+                    "id": road.id,
+                    "name": road.name,
+                    "length_m": round(road.geometry.length * 111_139, 1),
+                },
             }
         )
     _roads_cache = {"type": "FeatureCollection", "features": features}
@@ -253,24 +262,25 @@ def update_settings():
             _current_settings[key] = value
     save_settings(_current_settings)
     socketio.emit("settings", {"settings": _current_settings})
-    if "grid_cells" in payload:
-        ensure_grid_exists(int(payload["grid_cells"]), force=True)
-        if _grid_error:
-            return jsonify({"status": "error", "error": _grid_error}), 400
+    ensure_grid_exists(int(_current_settings.get("grid_cells", 64)), force=True)
+    if _grid_error:
+        return jsonify({"status": "error", "error": _grid_error}), 400
     return jsonify({"success": True, "settings": _current_settings})
 
 
 @app.post("/auto_assign")
 def auto_assign():
-    mode = request.args.get("mode", "grid")
-    advanced = request.args.get("advanced", "false").lower() == "true"
-    street_source = request.args.get("streetSource", _current_settings.get("street_source", "google"))
+    payload = request.get_json(silent=True) or {}
+    mode = payload.get("mode", _current_settings.get("mode", "grid"))
+    advanced = bool(payload.get("advanced", _current_settings.get("advanced", False)))
+    street_source = payload.get("streetSource", _current_settings.get("street_source", "google"))
     tractors = tractors_for_settings(_current_settings)
     if not tractors:
         return jsonify({"error": "Нет тракторов"}), 400
     if mode == "grid":
-        if not GRID_GEOJSON.exists():
-            ensure_grid_exists(int(_current_settings.get("grid_cells", 64)), force=True)
+        ensure_grid_exists(int(_current_settings.get("grid_cells", 64)), force=True)
+        if _grid_error:
+            return jsonify({"error": _grid_error}), 400
         features = json.loads(GRID_GEOJSON.read_text(encoding="utf-8"))
         roads_for_cells = None
         if advanced and ROADS_PATH.exists():
@@ -278,15 +288,10 @@ def auto_assign():
                 boundary = load_geo_boundary(GEO_PATH)
                 roads_for_cells = load_roads(ROADS_PATH, boundary)
             except Exception as exc:
-                socketio.emit(
-                    "progress",
-                    {
-                        "message": f"[{_timestamp()}] ⚠️ Не удалось загрузить дороги для оптимизации сетки: {exc}"
-                    },
+                _emit_log(
+                    f"[{_timestamp()}] [ASSIGN] ⚠️ Не удалось загрузить дороги для оптимизации сетки: {exc}"
                 )
-        _emit_log(
-            f"[{_timestamp()}] [ASSIGN] Автораспределение сетки (advanced={advanced})"
-        )
+        _emit_log(f"[{_timestamp()}] [ASSIGN] Автораспределение сетки (advanced={advanced})")
         assignments, summary = assign_cells_kmeans(
             features["features"],
             tractors,
@@ -296,7 +301,7 @@ def auto_assign():
         _assignments.clear()
         _assignments.update(assignments)
         ASSIGNMENTS_JSON.write_text(json.dumps(assignments, ensure_ascii=False, indent=2), encoding="utf-8")
-        socketio.emit("assignments", assignments)
+        socketio.emit("assignments_updated", {"assignments": assignments, "summary": summary})
         for item in summary:
             _emit_log(
                 f"[{_timestamp()}] [ASSIGN] {item['tractor']} → {int(item['cells'])} клеток, "
@@ -446,7 +451,7 @@ def _background_build() -> None:
                             "route_step",
                             {
                                 "tractor_id": tractor,
-                                "coords": coords,
+                                "polyline": coords,
                             },
                         )
                 continue
@@ -493,7 +498,7 @@ def _timestamp() -> str:
 def on_connect():
     socketio.emit("settings", {"settings": _current_settings})
     if _assignments:
-        socketio.emit("assignments", _assignments)
+        socketio.emit("assignments_updated", {"assignments": _assignments})
     if ROADS_ASSIGN_JSON.exists():
         socketio.emit("roads_assignment", json.loads(ROADS_ASSIGN_JSON.read_text(encoding="utf-8")))
     if _grid_error:
@@ -517,7 +522,7 @@ def on_assign_sector(payload):
         return
     _assignments[sector_id] = tractor_id
     ASSIGNMENTS_JSON.write_text(json.dumps(_assignments, ensure_ascii=False, indent=2), encoding="utf-8")
-    socketio.emit("assignments", _assignments)
+    socketio.emit("assignments_updated", {"assignments": _assignments})
 
 
 @socketio.on("assignments_reset")
@@ -530,7 +535,7 @@ def on_assignments_reset(payload):
     else:
         _assignments.clear()
     ASSIGNMENTS_JSON.write_text(json.dumps(_assignments, ensure_ascii=False, indent=2), encoding="utf-8")
-    socketio.emit("assignments", _assignments)
+    socketio.emit("assignments_updated", {"assignments": _assignments})
 
 
 @app.errorhandler(Exception)
