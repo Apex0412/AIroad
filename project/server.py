@@ -9,7 +9,7 @@ from typing import Dict, List
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from flask_socketio import SocketIO
-from shapely.geometry import Point
+from shapely.geometry import MultiPolygon, Point, Polygon
 
 from config import (
     APP_ROOT,
@@ -28,13 +28,21 @@ from config import (
     save_settings as config_save_settings,
 )
 from route_builder import TRACTOR_COLORS
+from route_builder.optimizer import Tractor
 from services import state as state_store
+from services.state import append_monitor_entry, reset_routes, set_assignments, set_grid, set_roads
 from services.assign import (
     auto_assign_cells,
     auto_assign_roads,
     load_cell_assignments,
 )
-from services.kml_io import build_grid, load_grid_file, read_roads_kml, read_zone_kml
+from services.kml_io import (
+    ZoneLoadError,
+    build_grid,
+    load_grid_file,
+    read_roads_kml,
+    read_zone_kml,
+)
 from services.routing import build_routes
 from services.tasks import run_async
 from utils.progress import emit_progress, init_progress
@@ -84,6 +92,7 @@ _assignments: Dict[str, str] = {}
 _roads_cache: dict | None = None
 _grid_build_lock = threading.Lock()
 _auto_assign_lock = threading.Lock()
+_roads_lock = threading.Lock()
 
 
 def _emit_log(message: str) -> None:
@@ -91,6 +100,23 @@ def _emit_log(message: str) -> None:
     payload = {"message": message}
     socketio.emit("log", payload)
     _append_log_line(message)
+    append_monitor_entry({"message": message, "time": _timestamp()})
+
+
+def _temporary_boundary() -> MultiPolygon:
+    lat = float(_current_settings.get("center_lat", _current_settings.get("base_lat", 0.0)) or 0.0)
+    lon = float(_current_settings.get("center_lon", _current_settings.get("base_lon", 0.0)) or 0.0)
+    size = 0.05
+    polygon = Polygon(
+        [
+            (lon - size, lat - size),
+            (lon + size, lat - size),
+            (lon + size, lat + size),
+            (lon - size, lat + size),
+            (lon - size, lat - size),
+        ]
+    )
+    return MultiPolygon([polygon])
 
 
 def _nearest_distance_km(lat: float, lon: float, roads) -> float | None:
@@ -153,17 +179,6 @@ def ensure_grid_exists(grid_cells: int, force: bool = False, async_build: bool =
     """Ensure that a fresh grid GeoJSON exists, optionally rebuilding asynchronously."""
 
     global _grid_error
-    if not GEO_PATH.exists():
-        _grid_error = "Отсутствует GEO.kml в директории data/"
-        socketio.emit("grid_error", {"message": _grid_error})
-        emit_progress("grid", _grid_error, 0)
-        return
-    is_valid, err = validate_geo_kml(GEO_PATH)
-    if not is_valid:
-        _grid_error = err or "Некорректный GEO.kml"
-        socketio.emit("grid_error", {"message": _grid_error})
-        emit_progress("grid", _grid_error, 0)
-        return
 
     needs_build = force or not GRID_GEOJSON.exists()
     if not needs_build:
@@ -177,8 +192,10 @@ def ensure_grid_exists(grid_cells: int, force: bool = False, async_build: bool =
             else:
                 _grid_error = None
                 socketio.emit("grid_error", {"message": None})
+                set_grid(data, error=None)
                 socketio.emit("grid_ready", {"cells": len(data.get("features", []))})
                 socketio.emit("grid_updated", data)
+                socketio.emit("map:update", {"grid": data})
         except Exception:
             needs_build = True
 
@@ -195,7 +212,20 @@ def _grid_build_worker(grid_cells: int) -> None:
         return
     try:
         emit_progress("grid", "Читаю GEO.kml…", 5)
-        boundary = read_zone_kml(GEO_PATH)
+        try:
+            if GEO_PATH.exists():
+                is_valid, err = validate_geo_kml(GEO_PATH)
+                if not is_valid:
+                    raise ZoneLoadError(err or "Некорректный GEO.kml")
+                boundary = read_zone_kml(GEO_PATH)
+                _emit_log(f"[{_timestamp()}] [LOAD] Загружаю GEO.kml…")
+            else:
+                raise ZoneLoadError("GEO.kml отсутствует")
+        except ZoneLoadError as exc:
+            _emit_log(
+                f"[{_timestamp()}] [LOAD] ⚠️ {exc} — создаю временную зону по координатам центра"
+            )
+            boundary = _temporary_boundary()
         emit_progress("grid", f"Генерирую сетку на {grid_cells} клеток…", 40)
         data = build_grid(boundary, grid_cells)
         emit_progress(
@@ -203,13 +233,16 @@ def _grid_build_worker(grid_cells: int) -> None:
         )
         _roads_cache = None
         _grid_error = None
+        set_grid(data, error=None)
         # if build_grid already saved file, data already read
         socketio.emit("grid_error", {"message": None})
         socketio.emit("grid_ready", {"cells": len(data.get("features", []))})
         socketio.emit("grid_updated", data)
+        socketio.emit("map:update", {"grid": data})
         emit_progress("grid", "✅ Сетка успешно построена", 100)
     except Exception as exc:  # pragma: no cover - defensive
         _grid_error = str(exc)
+        set_grid(None, error=_grid_error)
         socketio.emit("grid_error", {"message": _grid_error})
         emit_progress("grid", f"⚠️ {_grid_error}", 100)
     finally:
@@ -224,18 +257,29 @@ def _ensure_roads_geojson():
     global _roads_cache
     if _roads_cache is not None:
         return _roads_cache
-    if not (ROADS_PATH.exists() and GEO_PATH.exists()):
-        _emit_log(f"[{_timestamp()}] [ROADS] ⚠️ RoadCity.kml или GEO.kml не найдены")
-        emit_progress("roads", "RoadCity.kml не найден", 0)
-        return None
+    if not _roads_lock.acquire(blocking=False):
+        return _roads_cache
     try:
+        if not ROADS_PATH.exists():
+            message = "RoadCity.kml отсутствует"
+            _emit_log(f"[{_timestamp()}] [ROADS] ⚠️ {message}")
+            emit_progress("roads", f"⚠️ {message}", 10)
+            set_roads(None, error=message)
+            return None
+        try:
+            boundary = read_zone_kml(GEO_PATH)
+        except ZoneLoadError:
+            boundary = _temporary_boundary()
         emit_progress("roads", "Читаю RoadCity.kml…", 60)
-        boundary = read_zone_kml(GEO_PATH)
         roads = read_roads_kml(ROADS_PATH, boundary)
     except Exception as exc:
-        _emit_log(f"[{_timestamp()}] [ROADS] ⚠️ Не удалось загрузить дороги: {exc}")
-        emit_progress("roads", f"⚠️ Не удалось загрузить дороги: {exc}", 60)
+        message = f"Не удалось загрузить дороги: {exc}"
+        _emit_log(f"[{_timestamp()}] [ROADS] ⚠️ {message}")
+        emit_progress("roads", f"⚠️ {message}", 60)
+        set_roads(None, error=message)
         return None
+    finally:
+        _roads_lock.release()
     total_len = sum(road.geometry.length for road in roads) * 111_139
     _emit_log(
         f"[{_timestamp()}] [ROADS] Загрузил {len(roads)} линий, суммарно {total_len/1000:.1f} км"
@@ -256,6 +300,8 @@ def _ensure_roads_geojson():
             }
         )
     _roads_cache = {"type": "FeatureCollection", "features": features}
+    set_roads(_roads_cache, error=None)
+    socketio.emit("map:update", {"roads": _roads_cache})
     return _roads_cache
 
 
@@ -298,6 +344,23 @@ def roads_geojson():
     if geojson is None:
         return jsonify({"error": "Файл дорог отсутствует"}), 404
     return jsonify(geojson)
+
+
+@app.get("/api/state")
+def api_state():
+    ensure_grid_exists(int(_current_settings.get("grid_cells", 64)))
+    state_payload = {
+        "settings": _current_settings,
+        "grid": STATE.grid,
+        "grid_error": STATE.grid_error,
+        "roads": STATE.roads,
+        "roads_error": STATE.roads_error,
+        "assignments": STATE.assignments,
+        "assignments_summary": STATE.assignments_summary,
+        "routes_ready": STATE.routes_ready,
+        "routes_error": STATE.routes_error,
+    }
+    return jsonify(state_payload)
 
 
 @app.post("/settings")
@@ -382,8 +445,11 @@ def _auto_assign_task(
             roads_for_cells = None
             if advanced and ROADS_PATH.exists():
                 try:
-                    boundary = load_geo_boundary(GEO_PATH)
-                    roads_for_cells = load_roads(ROADS_PATH, boundary)
+                    boundary = read_zone_kml(GEO_PATH)
+                except ZoneLoadError:
+                    boundary = _temporary_boundary()
+                try:
+                    roads_for_cells = read_roads_kml(ROADS_PATH, boundary)
                 except Exception as exc:
                     emit_progress("assign", f"⚠️ Не удалось загрузить дороги: {exc}", 10)
             emit_progress("assign", f"Запускаю автораспределение {total} клеток", 5)
@@ -414,6 +480,7 @@ def _auto_assign_task(
                     json.dumps(assignments, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
+            set_assignments(assignments, summary)
             socketio.emit("assignments_updated", {"assignments": assignments, "summary": summary})
             for item in summary:
                 _emit_log(
@@ -446,6 +513,18 @@ def _auto_assign_task(
                 json.dumps(assignments, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            set_assignments(
+                assignments,
+                [
+                    {
+                        "tractor": tractor.name,
+                        "roads_m": stats.get(tractor.id, 0.0),
+                        "cells": 0,
+                        "area_km2": 0.0,
+                    }
+                    for tractor in tractors
+                ],
+            )
             socketio.emit("roads_assignment", assignments)
             _emit_log(
                 f"[{_timestamp()}] [ASSIGN] Автораспределение дорог завершено. {sum(stats.values()):.0f} м покрыто"
@@ -464,8 +543,11 @@ def check_base():
         emit_progress("base", f"⚠️ {message}", 0)
         return jsonify({"ok": False, "error": message}), 400
     try:
-        boundary = load_geo_boundary(GEO_PATH)
-        roads = load_roads(ROADS_PATH, boundary)
+        try:
+            boundary = read_zone_kml(GEO_PATH)
+        except ZoneLoadError:
+            boundary = _temporary_boundary()
+        roads = read_roads_kml(ROADS_PATH, boundary)
         distance = _nearest_distance_km(base_lat, base_lon, roads)
         warning = None
         if distance is None:
@@ -513,6 +595,7 @@ def clear_routes_endpoint():
             ROUTES_KML.unlink()
         except OSError:
             pass
+    reset_routes()
     socketio.emit("clear_routes", {})
     return jsonify({"success": True})
 
@@ -533,12 +616,17 @@ def _background_build() -> None:
         emit_progress("route", "Маршрутизатор уже запущен", 0)
         return
     socketio.emit("build_status", {"running": True})
+    reset_routes()
     try:
         emit_progress("route", "🚀 Запуск маршрутизации…", 5)
         build_routes(_current_settings, socketio)
+        STATE.routes_ready = True
+        STATE.routes_error = None
         socketio.emit("build_done", {"success": True})
     except Exception as exc:
         emit_progress("route", f"❌ Ошибка запуска: {exc}", 100)
+        STATE.routes_ready = False
+        STATE.routes_error = str(exc)
         socketio.emit("build_done", {"success": False})
     finally:
         global _build_thread
@@ -575,6 +663,7 @@ def on_assign_sector(payload):
         return
     _assignments[sector_id] = tractor_id
     ASSIGNMENTS_JSON.write_text(json.dumps(_assignments, ensure_ascii=False, indent=2), encoding="utf-8")
+    set_assignments(_assignments)
     socketio.emit("assignments_updated", {"assignments": _assignments})
 
 
@@ -588,6 +677,7 @@ def on_assignments_reset(payload):
     else:
         _assignments.clear()
     ASSIGNMENTS_JSON.write_text(json.dumps(_assignments, ensure_ascii=False, indent=2), encoding="utf-8")
+    set_assignments(_assignments)
     socketio.emit("assignments_updated", {"assignments": _assignments})
 
 
@@ -600,8 +690,12 @@ def bootstrap():
     global _current_settings, _assignments, _roads_cache
     _current_settings = load_settings()
     _assignments = load_assignments()
+    set_assignments(_assignments)
     _roads_cache = None
+    _emit_log(f"[{_timestamp()}] [LOAD] Загружаю GEO.kml…")
     ensure_grid_exists(int(_current_settings.get("grid_cells", 64)))
+    _emit_log(f"[{_timestamp()}] [LOAD] Загружаю RoadCity.kml…")
+    _ensure_roads_geojson()
 
 
 if __name__ == "__main__":

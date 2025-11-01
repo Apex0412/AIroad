@@ -466,6 +466,31 @@ function fetchGrid() {
 
 let roadsFetched = false;
 
+function renderRoads(data, { silent = false } = {}) {
+  if (!data || !Array.isArray(data.features)) {
+    if (!silent) appendLog('[ROADS] ⚠️ Данные дорог отсутствуют');
+    return;
+  }
+  if (roadsLayer) roadsLayer.remove();
+  roadLayers.clear();
+  roadsLayer = L.geoJSON(data, {
+    style: { color: '#94a3b8', weight: 2 },
+    onEachFeature(feature, layer) {
+      roadLayers.set(feature.properties.id, layer);
+      layer.bindTooltip(feature.properties.name || 'Без названия', { opacity: 0.8 });
+    },
+  }).addTo(map);
+  if (roadsLayer.getBounds().isValid() && state.mode === 'road') {
+    map.fitBounds(roadsLayer.getBounds(), { padding: [20, 20] });
+  }
+  if (!silent) {
+    const total = data.features.reduce((acc, feature) => acc + (feature.properties.length_m || 0), 0);
+    appendLog(`[ROADS] Загрузил ${data.features.length} линий, всего ${(total / 1000).toFixed(1)} км`);
+  }
+  roadsFetched = true;
+  if (!silent) setMapSpinner(false);
+}
+
 function loadRoadsLayer({ silent = false } = {}) {
   if (!silent) setMapSpinner(true);
   fetch('/roads')
@@ -473,26 +498,7 @@ function loadRoadsLayer({ silent = false } = {}) {
       if (!res.ok) throw new Error('Дороги недоступны');
       return res.json();
     })
-    .then((data) => {
-      if (roadsLayer) roadsLayer.remove();
-      roadLayers.clear();
-      roadsLayer = L.geoJSON(data, {
-        style: { color: '#94a3b8', weight: 2 },
-        onEachFeature(feature, layer) {
-          roadLayers.set(feature.properties.id, layer);
-          layer.bindTooltip(feature.properties.name || 'Без названия', { opacity: 0.8 });
-        },
-      }).addTo(map);
-      if (roadsLayer.getBounds().isValid() && state.mode === 'road') {
-        map.fitBounds(roadsLayer.getBounds(), { padding: [20, 20] });
-      }
-      if (!silent) {
-        const total = data.features.reduce((acc, feature) => acc + (feature.properties.length_m || 0), 0);
-        appendLog(`[ROADS] Загрузил ${data.features.length} линий, всего ${(total / 1000).toFixed(1)} км`);
-      }
-      roadsFetched = true;
-      if (!silent) setMapSpinner(false);
-    })
+    .then((data) => renderRoads(data, { silent }))
     .catch(() => {
       appendLog('[ROADS] ⚠️ Дороги не загружены');
       if (!silent) setMapSpinner(false);
@@ -732,6 +738,19 @@ socket.on('grid_updated', (data) => {
   }
   if (Array.isArray(data.features)) {
     gridMeta.textContent = `Сетка: ${data.features.length}`;
+  }
+});
+
+socket.on('map:update', (payload) => {
+  if (!payload) return;
+  if (payload.grid) {
+    if (state.mode === 'grid') {
+      renderGrid(payload.grid);
+    }
+  }
+  if (payload.roads) {
+    const silent = state.mode !== 'road';
+    renderRoads(payload.roads, { silent });
   }
 });
 
