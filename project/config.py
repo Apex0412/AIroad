@@ -13,12 +13,14 @@ DATA_DIR = APP_ROOT / "data"
 STATIC_DIR = APP_ROOT / "static"
 TEMPLATES_DIR = APP_ROOT / "templates"
 CACHE_DIR = APP_ROOT / "cache"
+LOGS_DIR = APP_ROOT / "logs"
 
 ENV_PATH = APP_ROOT / ".env"
 load_dotenv(ENV_PATH, override=True)
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 GEO_PATH = DATA_DIR / "GEO.kml"
 ROADS_PATH = DATA_DIR / "RoadCity.kml"

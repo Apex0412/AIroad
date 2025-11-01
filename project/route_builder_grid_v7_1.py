@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 from route_builder import TRACTOR_COLORS
 from route_builder.grid import load_geo_boundary
 from route_builder.kml_export import export_roads_kml, export_routes_kml
+from shapely.geometry import Point
+
 from route_builder.optimizer import Tractor
 from route_builder.router import RoutingSettings, build_routes
 from route_builder.roads import load_roads
@@ -73,6 +75,17 @@ def main() -> None:
     assignments = load_assignments(assignment_path)
 
     tractors = create_tractors(args.n_units, args.base_lat, args.base_lon)
+
+    base_point = Point(args.base_lon, args.base_lat)
+    if roads:
+        nearest = min((road.geometry.distance(base_point) for road in roads), default=None)
+        if nearest is not None:
+            distance_km = nearest * 111.139
+            print(f"[STATUS] Ближайшая дорога к базе: {distance_km:.2f} км", flush=True)
+            if distance_km > 100:
+                print("[STATUS] ⚠️ Координаты базы кажутся неверными", flush=True)
+
+    print(f"[STATUS] База: {args.base_lat:.6f}, {args.base_lon:.6f}", flush=True)
 
     settings = RoutingSettings(
         travel_mode=args.travel_mode,

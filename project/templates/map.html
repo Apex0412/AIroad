@@ -84,6 +84,7 @@
             <button class="btn secondary" id="clear-selected">🧼 Очистить трактор</button>
             <button class="btn secondary" id="reset-all">♻️ Сбросить всё</button>
             <button class="btn secondary" id="auto-assign">🔀 Авто-раздать районы</button>
+            <button class="btn secondary" id="check-base">🔍 Проверить базу</button>
             <button class="btn secondary" id="clear-routes">🧹 Очистить маршруты</button>
             <button class="btn primary" id="save-build">🧭 Построить маршруты</button>
             <button class="btn success" id="download-kml" type="button">⬇️ Скачать KML</button>
@@ -108,6 +109,17 @@
     <div id="global-progress" class="hidden">
       <div class="progress-bar"><div class="progress-fill"></div></div>
       <span id="progress-text">Готово</span>
+    </div>
+    <div id="action-monitor">
+      <header>
+        <div class="title">Монитор действий</div>
+        <div class="controls">
+          <button id="download-log" class="btn link">🧾 Скачать лог</button>
+          <button id="clear-monitor" class="btn link">🗑 Очистить</button>
+        </div>
+      </header>
+      <div class="progress-track"><div class="progress-inner"></div></div>
+      <div id="monitor-log" class="monitor-log"></div>
     </div>
     <script>
       const initialSettings = {{ settings|tojson }};

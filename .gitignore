@@ -10,4 +10,5 @@ project/data/assignments.json
 project/data/roads_assignment.json
 project/data/grid.geojson
 project/data/street_summary.csv
+project/logs/
 project/.venv/

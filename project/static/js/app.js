@@ -11,6 +11,9 @@ const state = {
   theme: 'light',
 };
 
+const logHistory = [];
+const monitorEntries = [];
+
 const map = L.map('map', { zoomControl: false }).setView(
   [initialSettings.center_lat, initialSettings.center_lon],
   13,
@@ -20,6 +23,8 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
   attribution: '&copy; OpenStreetMap contributors',
 }).addTo(map);
+
+updateBaseMarker(Number(initialSettings.base_lat), Number(initialSettings.base_lon));
 
 const socket = io();
 
@@ -38,6 +43,11 @@ const progressText = document.getElementById('progress-text');
 const gridMeta = document.getElementById('grid-meta');
 const tractorSelect = document.getElementById('tractor-select');
 const gridAlert = document.getElementById('grid-alert');
+const monitorBox = document.getElementById('action-monitor');
+const monitorProgress = monitorBox ? monitorBox.querySelector('.progress-inner') : null;
+const monitorLog = document.getElementById('monitor-log');
+const downloadLogBtn = document.getElementById('download-log');
+const clearMonitorBtn = document.getElementById('clear-monitor');
 
 const sectorLayers = new Map();
 const routeLayers = new Map();
@@ -45,6 +55,21 @@ const roadLayers = new Map();
 let gridLayer = null;
 let roadsLayer = null;
 let kmlLayer = null;
+let baseMarker = null;
+let baseCircle = null;
+
+const stageIcons = {
+  GRID: '🗺️',
+  ROADS: '🛣️',
+  ASSIGN: '🧩',
+  ROUTE: '🚜',
+  BASE: '🏁',
+  API: '📡',
+  DONE: '🎉',
+  ERROR: '⚠️',
+  SYSTEM: '✨',
+  LOG: '📝',
+};
 
 const themePreference = localStorage.getItem('dispatcher-theme');
 if (themePreference === 'dark') {
@@ -71,6 +96,36 @@ function applyTheme(next) {
 themeToggle.addEventListener('click', () => {
   applyTheme(state.theme === 'dark' ? 'light' : 'dark');
 });
+
+if (downloadLogBtn) {
+  downloadLogBtn.addEventListener('click', async () => {
+    try {
+      const resp = await fetch('/logs/current');
+      const text = await resp.text();
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `dispatcher_log_${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+      document.body.appendChild(link);
+      link.click();
+      setTimeout(() => {
+        URL.revokeObjectURL(link.href);
+        link.remove();
+      }, 0);
+      showToast('Лог сохранён', 'success');
+    } catch (error) {
+      showToast('Не удалось скачать лог', 'error');
+    }
+  });
+}
+
+if (clearMonitorBtn) {
+  clearMonitorBtn.addEventListener('click', () => {
+    monitorEntries.length = 0;
+    if (monitorLog) monitorLog.innerHTML = '';
+    if (monitorProgress) monitorProgress.style.width = '0%';
+  });
+}
 
 function showToast(message, kind = 'info', timeout = 4000) {
   const toast = document.createElement('div');
@@ -111,6 +166,131 @@ function updateGlobalProgress(stage, text, percent) {
   if (clamped >= 100) {
     setTimeout(() => progressBox.classList.add('hidden'), 1500);
   }
+  updateMonitorProgress(clamped, stage, text);
+}
+
+function updateMonitorProgress(percent, stage, text) {
+  if (!monitorProgress) return;
+  monitorProgress.style.width = `${Math.min(100, Math.max(0, percent || 0))}%`;
+  if (stage && text) {
+    addMonitorEntry(stage, text, percent);
+  }
+}
+
+function iconForStage(stage) {
+  if (!stage) return stageIcons.LOG;
+  const upper = stage.toUpperCase();
+  return stageIcons[upper] || stageIcons.LOG;
+}
+
+function stageFromMessage(message) {
+  if (!message) return 'LOG';
+  const match = message.match(/\[([^\]]+)\]/);
+  if (match && match[1]) {
+    const token = match[1].split(' ')[0];
+    return token.toUpperCase();
+  }
+  return 'LOG';
+}
+
+function addMonitorEntry(stage, text, percent) {
+  if (!monitorLog) return;
+  const key = `${stage}|${text}`;
+  const last = monitorEntries[monitorEntries.length - 1];
+  if (last && last.key === key) {
+    last.percent = percent;
+    return;
+  }
+  const entry = {
+    key,
+    stage,
+    text,
+    percent,
+    time: new Date(),
+  };
+  monitorEntries.push(entry);
+  const node = document.createElement('div');
+  node.className = 'entry';
+  const icon = document.createElement('span');
+  icon.className = 'icon';
+  icon.textContent = iconForStage(stage);
+  const content = document.createElement('div');
+  content.className = 'text';
+  const timeStr = entry.time.toLocaleTimeString();
+  content.innerHTML = `<strong>[${stage}]</strong> ${text} <span class="muted">(${timeStr})</span>`;
+  node.append(icon, content);
+  monitorLog.append(node);
+  monitorLog.scrollTop = monitorLog.scrollHeight;
+  if (monitorEntries.length > 400) {
+    monitorEntries.shift();
+    if (monitorLog.firstChild) monitorLog.removeChild(monitorLog.firstChild);
+  }
+}
+
+function updateBaseMarker(lat, lon) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+  const coords = [lat, lon];
+  if (!baseMarker) {
+    baseMarker = L.marker(coords, { title: 'База' }).addTo(map);
+    baseMarker.bindTooltip('🏁 База', { permanent: true, direction: 'top', offset: [0, -12] });
+  } else {
+    baseMarker.setLatLng(coords);
+  }
+  if (baseCircle) {
+    baseCircle.setLatLng(coords);
+  }
+}
+
+function highlightBase(distanceKm) {
+  if (!baseMarker) return;
+  if (baseCircle) {
+    map.removeLayer(baseCircle);
+  }
+  const radius = Math.max(distanceKm * 1000, 250);
+  baseCircle = L.circle(baseMarker.getLatLng(), {
+    radius,
+    color: '#38bdf8',
+    weight: 2,
+    fillOpacity: 0.1,
+  }).addTo(map);
+  map.flyTo(baseMarker.getLatLng(), Math.max(map.getZoom(), 13));
+}
+
+async function requestBaseCheck() {
+  const btn = document.getElementById('check-base');
+  if (!btn || btn.classList.contains('loading')) return;
+  btn.dataset.label = btn.textContent;
+  setBusy(btn, true);
+  btn.textContent = '⏳ Проверяю…';
+  appendLog('[BASE] Проверяю ближайшие дороги рядом с базой…');
+  try {
+    const resp = await fetch('/check_base', { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      const err = data.error || resp.statusText;
+      appendLog(`[BASE] ⚠️ ${err}`);
+      showToast(err, 'error');
+      return;
+    }
+    if (typeof data.base_lat === 'number' && typeof data.base_lon === 'number') {
+      updateBaseMarker(data.base_lat, data.base_lon);
+    }
+    if (typeof data.distance_km === 'number') {
+      appendLog(`[BASE] Расстояние до ближайшей линии: ${data.distance_km.toFixed(2)} км`);
+      highlightBase(data.distance_km);
+    }
+    if (data.warning) {
+      appendLog(`[BASE] ⚠️ ${data.warning}`);
+      showToast(data.warning, 'warn');
+    }
+    showToast('Проверка базы выполнена', 'success');
+  } catch (error) {
+    appendLog(`[BASE] ⚠️ ${error.message || error}`);
+    showToast('Ошибка проверки базы', 'error');
+  } finally {
+    setBusy(btn, false);
+    btn.textContent = btn.dataset.label || '🔍 Проверить базу';
+  }
 }
 
 function classifyMessage(message) {
@@ -129,12 +309,20 @@ function appendLog(message) {
   entry.innerHTML = `<strong>[${time}]</strong> ${message}`;
   logEl.appendChild(entry);
   logEl.scrollTop = logEl.scrollHeight;
+  logHistory.push(`[${time}] ${message}`);
+  if (logHistory.length > 5000) logHistory.shift();
+  addMonitorEntry(stageFromMessage(message), message);
 }
 
 document.getElementById('clear-log').addEventListener('click', () => {
   logEl.innerHTML = '';
   appendLog('🧾 Лог очищен');
 });
+
+const checkBaseBtn = document.getElementById('check-base');
+if (checkBaseBtn) {
+  checkBaseBtn.addEventListener('click', requestBaseCheck);
+}
 
 function buildTractors() {
   state.tractors = [];
@@ -563,6 +751,7 @@ socket.on('settings', (payload) => {
   state.advanced = Boolean(initialSettings.advanced);
   state.streetSource = initialSettings.street_source || state.streetSource;
   state.provider = initialSettings.routing_provider || state.provider;
+  updateBaseMarker(Number(initialSettings.base_lat), Number(initialSettings.base_lon));
   const modeInput = document.querySelector(`input[name="mode"][value="${state.mode}"]`);
   if (modeInput) modeInput.checked = true;
   if (advancedToggle) advancedToggle.checked = state.advanced;

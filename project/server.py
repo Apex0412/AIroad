@@ -8,8 +8,9 @@ from datetime import datetime
 from typing import Dict, List
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, Response, jsonify, render_template, request, send_file
 from flask_socketio import SocketIO
+from shapely.geometry import Point
 
 from config import (
     APP_ROOT,
@@ -17,6 +18,7 @@ from config import (
     DATA_DIR,
     GEO_PATH,
     GRID_GEOJSON,
+    LOGS_DIR,
     ROADS_ASSIGN_JSON,
     ROADS_COLORED_KML,
     ROADS_PATH,
@@ -44,7 +46,34 @@ load_dotenv(APP_ROOT / ".env", override=True)
 app = Flask(__name__, template_folder=str(APP_ROOT / "templates"), static_folder=str(APP_ROOT / "static"))
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "change_me")
 socketio = SocketIO(app, cors_allowed_origins="*")
-init_progress(socketio)
+
+_session_log: List[str] = []
+_log_file_path = None
+
+
+def _timestamp() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def _append_log_line(message: str) -> None:
+    global _log_file_path
+    stamped = message
+    if not (stamped.startswith("[") and len(stamped) > 3 and stamped[1:3].isdigit()):
+        stamped = f"[{_timestamp()}] {stamped}"
+    _session_log.append(stamped)
+    if len(_session_log) > 5000:
+        del _session_log[: len(_session_log) - 5000]
+    if _log_file_path is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _log_file_path = LOGS_DIR / f"session_{timestamp}.log"
+    try:
+        with (_log_file_path).open("a", encoding="utf-8") as handle:
+            handle.write(stamped + "\n")
+    except OSError:
+        pass
+
+
+init_progress(socketio, log_hook=_append_log_line)
 
 _build_lock = threading.Lock()
 _build_thread: threading.Thread | None = None
@@ -60,17 +89,30 @@ def _emit_log(message: str) -> None:
     app.logger.info(message)
     payload = {"message": message}
     socketio.emit("log", payload)
+    _append_log_line(message)
+
+
+def _nearest_distance_km(lat: float, lon: float, roads) -> float | None:
+    if not roads:
+        return None
+    point = Point(lon, lat)
+    nearest = min((road.geometry.distance(point) for road in roads), default=None)
+    if nearest is None:
+        return None
+    return nearest * 111.139
 
 
 def load_settings() -> Dict[str, object]:
+    base_lat_env = os.getenv("BASE_LAT") or os.getenv("CENTER_LAT", "54.920031")
+    base_lon_env = os.getenv("BASE_LON") or os.getenv("CENTER_LON", "37.408090")
     defaults = {
         "grid_cells": 64,
         "n_units": 18,
         "target_km": float(os.getenv("TARGET_KM_PER_TRACTOR", "30000")),
         "travel_mode": os.getenv("TRAVEL_MODE", "driving"),
         "max_waypoints": int(os.getenv("GOOGLE_MAX_WAYPOINTS", "23")),
-        "base_lat": float(os.getenv("CENTER_LAT", "54.920031")),
-        "base_lon": float(os.getenv("CENTER_LON", "37.408090")),
+        "base_lat": float(base_lat_env),
+        "base_lon": float(base_lon_env),
         "center_lat": float(os.getenv("CENTER_LAT", "54.920031")),
         "center_lon": float(os.getenv("CENTER_LON", "37.408090")),
         "use_base_as_start": os.getenv("USE_BASE_BY_DEFAULT", "true").lower() == "true",
@@ -80,6 +122,7 @@ def load_settings() -> Dict[str, object]:
         "advanced": os.getenv("ADVANCED_OPTIMIZATION", "false").lower() == "true",
         "mode": "grid" if os.getenv("USE_GRID_BY_DEFAULT", "true").lower() == "true" else "road",
         "routing_provider": os.getenv("ROUTING_PROVIDER", "google"),
+        "validate_coord_order": os.getenv("VALIDATE_COORD_ORDER", "true").lower() == "true",
     }
     return config_load_settings(defaults)
 
@@ -418,6 +461,41 @@ def _auto_assign_task(
         emit_progress("assign", f"⚠️ Ошибка автораспределения: {exc}", 100)
 
 
+@app.post("/check_base")
+def check_base():
+    base_lat = float(_current_settings.get("base_lat", 0.0))
+    base_lon = float(_current_settings.get("base_lon", 0.0))
+    if not GEO_PATH.exists() or not ROADS_PATH.exists():
+        message = "Нет GEO.kml или RoadCity.kml для проверки"
+        emit_progress("base", f"⚠️ {message}", 0)
+        return jsonify({"ok": False, "error": message}), 400
+    try:
+        boundary = load_geo_boundary(GEO_PATH)
+        roads = load_roads(ROADS_PATH, boundary)
+        distance = _nearest_distance_km(base_lat, base_lon, roads)
+        warning = None
+        if distance is None:
+            warning = "Дороги не найдены"
+        elif distance > 10:
+            warning = "Нет дорог рядом с базой, проверь координаты"
+        progress_text = (
+            f"Проверка базы завершена: {distance:.2f} км" if distance is not None else "Дороги не найдены"
+        )
+        emit_progress("base", progress_text, 55)
+        return jsonify(
+            {
+                "ok": True,
+                "distance_km": distance,
+                "base_lat": base_lat,
+                "base_lon": base_lon,
+                "warning": warning,
+            }
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        emit_progress("base", f"⚠️ Ошибка проверки базы: {exc}", 0)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.post("/build_routes")
 def build_routes_endpoint():
     global _build_thread
@@ -445,6 +523,17 @@ def clear_routes_endpoint():
     return jsonify({"success": True})
 
 
+@app.get("/logs/current")
+def download_log():
+    filename = "dispatcher_log.txt"
+    content = "\n".join(_session_log) if _session_log else "Лог пуст."
+    headers = {
+        "Content-Disposition": f"attachment; filename={filename}",
+        "Cache-Control": "no-store",
+    }
+    return Response(content, mimetype="text/plain; charset=utf-8", headers=headers)
+
+
 def _background_build() -> None:
     if not _build_lock.acquire(blocking=False):
         emit_progress("route", "Маршрутизатор уже запущен", 0)
@@ -452,6 +541,54 @@ def _background_build() -> None:
     socketio.emit("build_status", {"running": True})
     try:
         emit_progress("route", "🚀 Запуск маршрутизации…", 5)
+        base_lat = float(_current_settings.get("base_lat", 0.0))
+        base_lon = float(_current_settings.get("base_lon", 0.0))
+        emit_progress("base", "Проверяю координаты базы…", 8)
+        _emit_log(f"[{_timestamp()}] [BASE] Старт маршрутов от базы: {base_lat:.6f}, {base_lon:.6f}")
+        if GEO_PATH.exists() and ROADS_PATH.exists():
+            try:
+                boundary = load_geo_boundary(GEO_PATH)
+                roads = load_roads(ROADS_PATH, boundary)
+                if roads:
+                    base_point = Point(base_lon, base_lat)
+                    nearest = min((road.geometry.distance(base_point) for road in roads), default=0.0)
+                    nearest_km = nearest * 111.139
+                    _emit_log(
+                        f"[{_timestamp()}] [DEBUG] Проверено расстояние до ближайшей линии: {nearest_km:.2f} км"
+                    )
+                    if (
+                        nearest_km > 30
+                        and bool(_current_settings.get("validate_coord_order", True))
+                    ):
+                        swapped_point = Point(base_lat, base_lon)
+                        swapped = min((road.geometry.distance(swapped_point) for road in roads), default=nearest)
+                        swapped_km = swapped * 111.139
+                        if swapped_km < nearest_km:
+                            _emit_log(
+                                f"[{_timestamp()}] [BASE] Обнаружена возможная перестановка широты/долготы — исправляю"
+                            )
+                            _current_settings["base_lat"], _current_settings["base_lon"] = (
+                                float(base_lon),
+                                float(base_lat),
+                            )
+                            base_lat = float(_current_settings["base_lat"])
+                            base_lon = float(_current_settings["base_lon"])
+                            save_settings(_current_settings)
+                            socketio.emit("settings", {"settings": _current_settings})
+                            nearest_km = swapped_km
+                            _emit_log(
+                                f"[{_timestamp()}] [BASE] Новые координаты базы: {base_lat:.6f}, {base_lon:.6f}"
+                            )
+                    if nearest_km > 100:
+                        emit_progress("route", "⚠️ [ROUTE ERROR] Координаты базы вне зоны или перепутаны", 15)
+                    elif nearest_km > 10:
+                        emit_progress(
+                            "route",
+                            "⚠️ Нет дорог рядом с базой, проверь координаты",
+                            15,
+                        )
+            except Exception as exc:
+                _emit_log(f"[{_timestamp()}] [BASE] Не удалось проверить координаты: {exc}")
         args = [
             sys.executable,
             str(APP_ROOT / "route_builder_grid_v7_1.py"),
@@ -571,10 +708,6 @@ def _background_build() -> None:
         _build_thread = None
         _build_lock.release()
         socketio.emit("build_status", {"running": False})
-
-
-def _timestamp() -> str:
-    return datetime.now().strftime("%H:%M:%S")
 
 
 @socketio.on("connect")
