@@ -345,6 +345,56 @@ body.theme-dark .sidebar {
   flex-wrap: wrap;
 }
 
+.status-panel {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.45);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.theme-light .status-panel {
+  background: rgba(241, 245, 249, 0.85);
+  border-color: rgba(148, 163, 184, 0.35);
+}
+
+.status-panel header {
+  font-weight: 600;
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-panel ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.status-panel li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: rgba(100, 116, 139, 0.1);
+  font-size: 0.82rem;
+}
+
+.status-panel li.ok {
+  background: rgba(34, 197, 94, 0.12);
+  color: #22c55e;
+}
+
+.status-panel li.warn {
+  background: rgba(234, 179, 8, 0.12);
+  color: #facc15;
+}
+
 .status {
   padding: 4px 10px;
   border-radius: 999px;

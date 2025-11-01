@@ -19,6 +19,7 @@ class DispatcherState:
     route_stats: Optional[Dict[str, Any]] = None
     base_info: Optional[Dict[str, Any]] = None
     monitor: list[Dict[str, Any]] = field(default_factory=list)
+    system_status: list[Dict[str, Any]] = field(default_factory=list)
 
 
 STATE = DispatcherState()
@@ -53,3 +54,7 @@ def append_monitor_entry(entry: Dict[str, Any]) -> None:
     # keep monitor log bounded
     if len(STATE.monitor) > 2000:
         STATE.monitor = STATE.monitor[-2000:]
+
+
+def set_system_status(items: list[Dict[str, Any]]) -> None:
+    STATE.system_status = items

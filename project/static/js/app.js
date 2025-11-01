@@ -1,4 +1,4 @@
-/* global L, io, initialSettings, gridError, tractorColors, hasGoogleKey, hasYandexKey */
+/* global L, io, initialSettings, gridError, tractorColors, hasGoogleKey, hasYandexKey, initialSystemStatus */
 const state = {
   assignments: {},
   tractors: [],
@@ -12,6 +12,7 @@ const state = {
   routeStats: initialRouteStats || null,
   routesReady: Boolean(initialRoutesReady),
   buildStartedAt: null,
+  systemStatus: Array.isArray(initialSystemStatus) ? initialSystemStatus : [],
 };
 
 const logHistory = [];
@@ -63,6 +64,8 @@ const statsFields = statsCard
       duration: statsCard.querySelector('[data-stat="duration"]'),
     }
   : null;
+const systemCheckBtn = document.getElementById('system-check');
+const statusList = document.getElementById('status-list');
 
 const sectorLayers = new Map();
 const routeLayers = new Map();
@@ -89,6 +92,7 @@ const stageIcons = {
 const storedTheme = localStorage.getItem('dispatcher-theme');
 const initialTheme = storedTheme || state.theme;
 applyTheme(initialTheme, false);
+renderSystemStatus(state.systemStatus);
 
 function toggleSidebar(force) {
   if (window.innerWidth >= 992) return;
@@ -200,6 +204,22 @@ function applyRouteLengths(lengthMap = {}) {
     }
   });
   renderLegend();
+}
+
+function renderSystemStatus(items) {
+  if (!statusList) return;
+  const list = Array.isArray(items) ? items : [];
+  statusList.innerHTML = '';
+  list.forEach((item) => {
+    const li = document.createElement('li');
+    li.className = item.status || 'warn';
+    const title = document.createElement('strong');
+    title.textContent = item.label || '';
+    const span = document.createElement('span');
+    span.textContent = item.message || '';
+    li.append(title, span);
+    statusList.appendChild(li);
+  });
 }
 
 function updateStatsCard(stats) {
@@ -755,6 +775,33 @@ function resetAllAssignments() {
   socket.emit('assignments_reset', {});
 }
 
+async function runSystemCheck() {
+  if (!systemCheckBtn) return;
+  if (systemCheckBtn.disabled) return;
+  systemCheckBtn.dataset.label = systemCheckBtn.dataset.label || systemCheckBtn.textContent;
+  setBusy(systemCheckBtn, true);
+  systemCheckBtn.textContent = '⏳ Проверка…';
+  appendLog('[SYSTEM] Запускаю проверку системы…');
+  showToast('Проверка системы запущена', 'info');
+  try {
+    const response = await fetch('/system/check', { method: 'POST' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (data.status === 'running') {
+      appendLog('[SYSTEM] Проверка уже выполняется');
+      showToast('Проверка уже выполняется', 'info');
+      systemCheckBtn.textContent = systemCheckBtn.dataset.label;
+      setBusy(systemCheckBtn, false);
+      return;
+    }
+  } catch (error) {
+    appendLog(`[SYSTEM] ⚠️ Не удалось запустить проверку: ${error.message}`);
+    showToast('Не удалось запустить проверку', 'error');
+    setBusy(systemCheckBtn, false);
+    systemCheckBtn.textContent = systemCheckBtn.dataset.label;
+  }
+}
+
 tractorSelect.addEventListener('change', (event) => {
   state.currentTractor = event.target.value;
 });
@@ -766,6 +813,9 @@ document.getElementById('download-kml').addEventListener('click', downloadKml);
 document.getElementById('clear-routes').addEventListener('click', clearRoutes);
 document.getElementById('clear-selected').addEventListener('click', clearAssignmentsForCurrent);
 document.getElementById('reset-all').addEventListener('click', resetAllAssignments);
+if (systemCheckBtn) {
+  systemCheckBtn.addEventListener('click', runSystemCheck);
+}
 
 Array.from(document.querySelectorAll('input[name="mode"]')).forEach((el) => {
   el.addEventListener('change', () => {
@@ -802,6 +852,25 @@ function handleLogEvent(data) {
 }
 
 socket.on('log', handleLogEvent);
+
+socket.on('system_status', (payload) => {
+  if (payload && Array.isArray(payload.items)) {
+    state.systemStatus = payload.items;
+    renderSystemStatus(payload.items);
+  }
+});
+
+socket.on('system_check_done', (payload) => {
+  if (systemCheckBtn) {
+    systemCheckBtn.textContent = systemCheckBtn.dataset.label || '🧪 Проверить систему';
+    setBusy(systemCheckBtn, false);
+  }
+  if (payload && payload.success) {
+    showToast('Проверка системы завершена', 'success');
+  } else if (payload && payload.error) {
+    showToast(`Ошибка проверки: ${payload.error}`, 'error');
+  }
+});
 
 socket.on('progress', (payload) => {
   if (!payload) return;

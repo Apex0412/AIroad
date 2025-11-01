@@ -32,6 +32,7 @@ from config import (
 from route_builder import TRACTOR_COLORS
 from route_builder.optimizer import Tractor
 from services import state as state_store
+from services.bootstrap import ensure_initial_files
 from services.state import (
     append_monitor_entry,
     reset_routes,
@@ -39,7 +40,9 @@ from services.state import (
     set_grid,
     set_roads,
     set_route_stats,
+    set_system_status,
 )
+from services.system_check import run_system_check
 from services.assign import (
     auto_assign_cells,
     auto_assign_roads,
@@ -103,6 +106,7 @@ _grid_build_lock = threading.Lock()
 _auto_assign_lock = threading.Lock()
 _roads_lock = threading.Lock()
 _build_start_time: float | None = None
+_system_check_lock = threading.Lock()
 
 
 def _collect_state_snapshot() -> Dict[str, object]:
@@ -125,6 +129,7 @@ def _collect_state_snapshot() -> Dict[str, object]:
         "grid": grid_meta,
         "routes": routes_meta,
         "theme": settings_copy.get("theme", "light"),
+        "system_status": STATE.system_status,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
     return snapshot
@@ -198,6 +203,9 @@ def _load_state_file() -> None:
         set_route_stats(stats_payload)
 
     STATE.settings = dict(_current_settings)
+    system_status_payload = payload.get("system_status")
+    if isinstance(system_status_payload, list):
+        set_system_status(system_status_payload)
 
     tractors = int(_current_settings.get("n_units", 0))
     grid_cells = payload.get("grid", {}).get("cells") or _current_settings.get("grid_cells")
@@ -238,6 +246,47 @@ def _nearest_distance_km(lat: float, lon: float, roads) -> float | None:
     if nearest is None:
         return None
     return nearest * 111.139
+
+
+def _current_system_status() -> List[Dict[str, str]]:
+    statuses: List[Dict[str, str]] = []
+    statuses.append({
+        "kind": "system",
+        "label": "Flask",
+        "status": "ok",
+        "message": "Сервер активен",
+    })
+    statuses.append({
+        "kind": "system",
+        "label": "Socket.IO",
+        "status": "ok",
+        "message": "Веб-сокеты готовы",
+    })
+    statuses.append({
+        "kind": "file",
+        "label": "GEO.kml",
+        "status": "ok" if GEO_PATH.exists() else "warn",
+        "message": "GEO.kml найден" if GEO_PATH.exists() else "GEO.kml отсутствует",
+    })
+    statuses.append({
+        "kind": "file",
+        "label": "RoadCity.kml",
+        "status": "ok" if ROADS_PATH.exists() else "warn",
+        "message": "RoadCity.kml найден" if ROADS_PATH.exists() else "RoadCity.kml отсутствует",
+    })
+    statuses.append({
+        "kind": "env",
+        "label": "Google API",
+        "status": "ok" if env_google_key() else "warn",
+        "message": "Ключ Google API активен" if env_google_key() else "Ключ Google API отсутствует",
+    })
+    statuses.append({
+        "kind": "env",
+        "label": "Yandex API",
+        "status": "ok" if env_yandex_key() else "warn",
+        "message": "Ключ Yandex API активен" if env_yandex_key() else "Ключ Yandex API отсутствует",
+    })
+    return statuses
 
 
 def load_settings() -> Dict[str, object]:
@@ -433,6 +482,7 @@ def index():
         tractor_colors=TRACTOR_COLORS,
         routes_ready=STATE.routes_ready and ROUTES_KML.exists(),
         route_stats=STATE.route_stats,
+        system_status=STATE.system_status or _current_system_status(),
     )
 
 
@@ -464,6 +514,38 @@ def roads_geojson():
     return jsonify(geojson)
 
 
+@app.post("/system/check")
+def system_check():
+    if not _system_check_lock.acquire(blocking=False):
+        return jsonify({"status": "running"}), 202
+
+    def worker():
+        try:
+            emit_progress("system", "🔍 Проверка системы…", 5)
+            statuses = run_system_check(
+                base_lat=float(_current_settings.get("base_lat", 0.0)),
+                base_lon=float(_current_settings.get("base_lon", 0.0)),
+                google_key=env_google_key(),
+                yandex_key=env_yandex_key(),
+            )
+            set_system_status(statuses)
+            for item in statuses:
+                _emit_log(f"[{_timestamp()}] [TEST] {item['label']}: {item['message']}")
+            socketio.emit("system_status", {"items": statuses})
+            emit_progress("system", "✅ Проверка завершена", 100)
+            socketio.emit("system_check_done", {"success": True})
+            _persist_state()
+        except Exception as exc:  # pragma: no cover - defensive
+            _emit_log(f"[{_timestamp()}] [TEST] ⚠️ Ошибка проверки: {exc}")
+            emit_progress("system", f"⚠️ {exc}", 100)
+            socketio.emit("system_check_done", {"success": False, "error": str(exc)})
+        finally:
+            _system_check_lock.release()
+
+    run_async(worker)
+    return jsonify({"status": "started"})
+
+
 @app.get("/api/state")
 def api_state():
     ensure_grid_exists(int(_current_settings.get("grid_cells", 64)))
@@ -478,6 +560,7 @@ def api_state():
         "routes_ready": STATE.routes_ready,
         "routes_error": STATE.routes_error,
         "route_stats": STATE.route_stats,
+        "system_status": STATE.system_status,
     }
     return jsonify(state_payload)
 
@@ -855,6 +938,12 @@ def bootstrap():
     global _current_settings, _assignments, _roads_cache
     _current_settings = load_settings()
     STATE.settings = dict(_current_settings)
+    for message in ensure_initial_files(
+        float(_current_settings.get("base_lat", 54.909901)),
+        float(_current_settings.get("base_lon", 37.363422)),
+    ):
+        _emit_log(f"[{_timestamp()}] {message}")
+    set_system_status(_current_system_status())
     _assignments = load_assignments()
     set_assignments(_assignments)
     _roads_cache = None

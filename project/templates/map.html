@@ -30,6 +30,14 @@
           <span class="status {{ 'ok' if has_google_key else 'warn' }}">Google {{ 'OK' if has_google_key else 'нет ключа' }}</span>
           <span class="status {{ 'ok' if has_yandex_key else 'warn' }}">Yandex {{ 'OK' if has_yandex_key else 'нет ключа' }}</span>
         </div>
+        <section class="status-panel" id="status-panel">
+          <header>📁 Проверка системы</header>
+          <ul id="status-list">
+            {% for item in system_status %}
+            <li class="{{ item.status }}"><strong>{{ item.label }}</strong><span>{{ item.message }}</span></li>
+            {% endfor %}
+          </ul>
+        </section>
         <section class="panel">
           <header class="panel-header">
             <h2>Параметры</h2>
@@ -85,6 +93,7 @@
             <button class="btn secondary" id="reset-all">♻️ Сбросить всё</button>
             <button class="btn secondary" id="auto-assign">🔀 Авто-раздать районы</button>
             <button class="btn secondary" id="check-base">🔍 Проверить базу</button>
+            <button class="btn secondary" id="system-check">🧪 Проверить систему</button>
             <button class="btn secondary" id="clear-routes">🧹 Очистить маршруты</button>
             <button class="btn primary" id="save-build">🧭 Построить маршруты</button>
             <button class="btn success" id="download-kml" type="button" {{ '' if routes_ready else 'disabled' }}>⬇️ Скачать KML</button>
@@ -142,6 +151,7 @@
       const hasYandexKey = {{ has_yandex_key|tojson }};
       const initialRouteStats = {{ route_stats|tojson }};
       const initialRoutesReady = {{ routes_ready|tojson }};
+      const initialSystemStatus = {{ system_status|tojson }};
     </script>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
