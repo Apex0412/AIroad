@@ -13,6 +13,7 @@
       src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
       crossorigin=""
     ></script>
+    <script src="https://unpkg.com/leaflet-plugins/layer/vector/KML.js"></script>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
     <style>
       html,
@@ -324,6 +325,7 @@
         </select>
         <button id="clear-tractor" class="secondary">Очистить выделение для трактора</button>
         <button id="reset-all" class="secondary">Сбросить всё</button>
+        <button id="auto-assign" class="secondary">🎲 Автораспределение</button>
         <button id="build" class="primary">💾 Сохранить и построить</button>
         <button id="download" class="secondary" disabled>⬇️ Скачать KML</button>
 
@@ -388,6 +390,7 @@
       const buildBtn = document.getElementById("build");
       const clearBtn = document.getElementById("clear-tractor");
       const resetBtn = document.getElementById("reset-all");
+      const autoAssignBtn = document.getElementById("auto-assign");
       const applySettingsBtn = document.getElementById("apply-settings");
       const nUnitsInput = document.getElementById("n-units");
       const targetKmInput = document.getElementById("target-km");
@@ -407,6 +410,7 @@
       let kmlReady = false;
       let isBuilding = false;
       let gridErrorMessage = "";
+      let routesLayer = null;
       rebuildTractorControls(tractorList);
       applySettingsSummary();
       updateGridIndicators();
@@ -422,6 +426,10 @@
         recolorAll();
         kmlReady = false;
         updateActionButtons();
+        if (routesLayer) {
+          map.removeLayer(routesLayer);
+          routesLayer = null;
+        }
       });
 
       socket.on("assign_sector", ({ sector_id, tractor_id }) => {
@@ -434,6 +442,10 @@
         recolorSector(sector_id);
         kmlReady = false;
         updateActionButtons();
+        if (routesLayer) {
+          map.removeLayer(routesLayer);
+          routesLayer = null;
+        }
       });
 
       socket.on("progress", ({ message }) => {
@@ -442,7 +454,14 @@
 
       socket.on("build_status", ({ running }) => {
         isBuilding = Boolean(running);
+        if (running) {
+          kmlReady = false;
+        }
         updateActionButtons();
+        if (running && routesLayer) {
+          map.removeLayer(routesLayer);
+          routesLayer = null;
+        }
       });
 
       socket.on("grid_error", ({ message }) => {
@@ -452,8 +471,41 @@
 
       socket.on("build_done", ({ success }) => {
         isBuilding = false;
-        kmlReady = Boolean(success);
         updateActionButtons();
+        if (success) {
+          appendLog("Маршруты готовы, добавляю слой...");
+          fetch("/routes_grid.kml")
+            .then((resp) => {
+              if (!resp.ok) {
+                throw new Error(`HTTP ${resp.status}`);
+              }
+              return resp.text();
+            })
+            .then((kmlText) => {
+              if (routesLayer) {
+                map.removeLayer(routesLayer);
+              }
+              const parser = new DOMParser();
+              const kml = parser.parseFromString(kmlText, "text/xml");
+              routesLayer = new L.KML(kml);
+              routesLayer.addTo(map);
+              const bounds = routesLayer.getBounds();
+              if (bounds && bounds.isValid()) {
+                map.fitBounds(bounds, { padding: [40, 40] });
+              }
+              kmlReady = true;
+              updateActionButtons();
+            })
+            .catch((error) => {
+              appendLog(`Не удалось загрузить маршруты: ${error.message}`);
+              kmlReady = false;
+              updateActionButtons();
+            });
+        } else {
+          appendLog("Построение маршрутов завершилось с ошибкой.");
+          kmlReady = false;
+          updateActionButtons();
+        }
       });
 
       socket.on("settings", ({ settings, tractors, grid_error }) => {
@@ -545,12 +597,20 @@
         downloadBtn.disabled = !canDownload;
         downloadBtn.classList.toggle("primary", canDownload);
         downloadBtn.classList.toggle("secondary", !canDownload);
+        if (autoAssignBtn) {
+          autoAssignBtn.disabled = Boolean(gridErrorMessage) || isBuilding;
+        }
       }
 
       function setGridError(message, options = {}) {
         const trimmed = (message || "").toString().trim();
         const changed = gridErrorMessage !== trimmed;
         gridErrorMessage = trimmed;
+        if (trimmed && routesLayer) {
+          map.removeLayer(routesLayer);
+          routesLayer = null;
+          kmlReady = false;
+        }
         if (gridErrorBanner) {
           if (trimmed) {
             gridErrorBanner.style.display = "block";
@@ -649,6 +709,10 @@
             socket.emit("assign_sector", { sector_id: sectorId, tractor_id: null });
           }
         });
+        if (routesLayer) {
+          map.removeLayer(routesLayer);
+          routesLayer = null;
+        }
       });
 
       resetBtn.addEventListener("click", () => {
@@ -657,7 +721,31 @@
         Object.keys(assignments).forEach((key) => delete assignments[key]);
         recolorAll();
         socket.emit("assignments_reset", {});
+        if (routesLayer) {
+          map.removeLayer(routesLayer);
+          routesLayer = null;
+        }
       });
+
+      if (autoAssignBtn) {
+        autoAssignBtn.addEventListener("click", () => {
+          if (autoAssignBtn.disabled) return;
+          appendLog("Запускаю автораспределение...");
+          kmlReady = false;
+          updateActionButtons();
+          fetch("/auto_assign", { method: "POST" })
+            .then((resp) => resp.json().then((data) => ({ ok: resp.ok, data })))
+            .then(({ ok, data }) => {
+              if (!ok) {
+                throw new Error(data?.error || "Не удалось выполнить автораспределение");
+              }
+              appendLog(`Автораспределение завершено: ${data.assigned || 0} клеток`);
+            })
+            .catch((error) => {
+              appendLog(`Ошибка автораспределения: ${error.message}`);
+            });
+        });
+      }
 
       if (gridSelect) {
         gridSelect.addEventListener("change", () => {
@@ -695,6 +783,10 @@
         isBuilding = true;
         kmlReady = false;
         updateActionButtons();
+        if (routesLayer) {
+          map.removeLayer(routesLayer);
+          routesLayer = null;
+        }
         appendLog("Запускаю построение маршрутов...");
         fetch("/run", {
           method: "POST",

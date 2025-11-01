@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -161,7 +162,7 @@ def set_grid_error(message: Optional[str]) -> None:
     _grid_error = cleaned
     payload = {"message": cleaned}
     try:
-        socketio.emit("grid_error", payload, broadcast=True)
+        socketio.emit("grid_error", payload)
     except RuntimeError:
         # Во время инициализации Flask-SocketIO может ещё не быть готов для отправки.
         pass
@@ -235,7 +236,7 @@ def ensure_grid_exists(grid_cells: Optional[int] = None, force: bool = False) ->
 
     app.logger.info("Генерация сетки (%s клеток)...", desired_cells)
     args = [
-        os.sys.executable,
+        sys.executable,
         str(APP_ROOT / "route_builder_grid_v7_1.py"),
         "--geo",
         str(GEO_PATH),
@@ -419,7 +420,7 @@ def _background_build() -> None:
         ensure_grid_exists(settings_snapshot.get("grid_cells"), force=True)
         set_grid_error(None)
         args = [
-            os.sys.executable,
+            sys.executable,
             str(APP_ROOT / "route_builder_grid_v7_1.py"),
             "--geo",
             str(GEO_PATH),
@@ -453,7 +454,18 @@ def _background_build() -> None:
         else:
             args.append("--no-use-base-start")
         app.logger.info("Запускаю построение маршрутов")
-        socketio.emit("build_status", {"running": True}, broadcast=True)
+        socketio.emit("build_status", {"running": True})
+        socketio.emit("progress", {"message": "🚜 Запуск маршрутизации..."})
+        try:
+            ensure_grid_exists(settings_snapshot.get("grid_cells"), force=True)
+            set_grid_error(None)
+        except Exception as ensure_exc:  # noqa: BLE001
+            message = f"❌ Ошибка подготовки сетки: {ensure_exc}"
+            socketio.emit("progress", {"message": message})
+            set_grid_error(str(ensure_exc))
+            socketio.emit("build_done", {"success": False})
+            return
+
         process = subprocess.Popen(
             args,
             cwd=APP_ROOT,
@@ -463,31 +475,37 @@ def _background_build() -> None:
             bufsize=1,
         )
         assert process.stdout is not None
-        for line in process.stdout:
+        for line in iter(process.stdout.readline, ""):
             cleaned = _ansi_regex.sub("", line).strip()
             if not cleaned:
                 continue
             socketio.emit("progress", {"message": cleaned})
         returncode = process.wait()
         if returncode == 0:
-            socketio.emit("progress", {"message": "Маршруты построены"})
+            socketio.emit("progress", {"message": "✅ Маршруты построены"})
             socketio.emit("build_done", {"success": True})
         else:
-            socketio.emit("progress", {"message": f"Ошибка построения (код {returncode})"})
+            socketio.emit(
+                "progress",
+                {"message": f"❌ Ошибка subprocess: код {returncode}"},
+            )
             socketio.emit("build_done", {"success": False})
     except Exception as exc:  # noqa: BLE001
+        socketio.emit("progress", {"message": f"❌ Ошибка: {exc}"})
         set_grid_error(str(exc))
-        socketio.emit("progress", {"message": f"Исключение: {exc}"})
         socketio.emit("build_done", {"success": False})
     finally:
-        socketio.emit("build_status", {"running": False}, broadcast=True)
+        socketio.emit("build_status", {"running": False})
         _build_lock.release()
 
 
 @app.post("/settings")
 def update_settings() -> Response:
     initialize_state()
-    data = request.get_json(force=True, silent=True) or {}
+    try:
+        data = request.get_json(force=True)
+    except Exception:  # noqa: BLE001
+        return jsonify({"error": "Некорректный JSON"}), 400
     if not isinstance(data, dict):
         return jsonify({"error": "Ожидался JSON-объект"}), 400
     with _settings_lock:
@@ -524,7 +542,7 @@ def update_settings() -> Response:
     if errors:
         return jsonify({"error": "; ".join(errors)}), 400
     if not changed and not (_grid_error and grid_requested is not None):
-        return jsonify({"status": "unchanged", "settings": new_settings, "grid_error": _grid_error})
+        return jsonify({"success": True, "settings": new_settings, "grid_error": _grid_error})
 
     grid_changed = "grid_cells" in changed
     n_units_changed = "n_units" in changed
@@ -532,6 +550,7 @@ def update_settings() -> Response:
     if grid_changed or (_grid_error and grid_requested is not None):
         try:
             ensure_grid_exists(int(new_settings["grid_cells"]), force=True)
+            set_grid_error(None)
         except Exception as exc:  # noqa: BLE001
             set_grid_error(str(exc))
             return jsonify({"error": f"Не удалось сформировать сетку: {exc}"}), 500
@@ -561,14 +580,13 @@ def update_settings() -> Response:
             "tractors": tractors_for_settings(settings_snapshot),
             "grid_error": _grid_error,
         },
-        broadcast=True,
     )
     if assignments_cleared:
-        socketio.emit("assignments", _current_assignments, broadcast=True)
+        socketio.emit("assignments", _current_assignments)
 
     return jsonify(
         {
-            "status": "ok",
+            "success": True,
             "settings": settings_snapshot,
             "tractors": tractors_for_settings(settings_snapshot),
             "assignments_cleared": assignments_cleared,
@@ -608,7 +626,7 @@ def assign_sector(payload):
         else:
             _current_assignments.pop(str(sector_id), None)
         save_assignments(_current_assignments)
-    emit("assign_sector", {"sector_id": sector_id, "tractor_id": tractor_id}, broadcast=True, include_self=False)
+    socketio.emit("assign_sector", {"sector_id": sector_id, "tractor_id": tractor_id})
 
 
 @socketio.on("assignments_reset")
@@ -617,7 +635,59 @@ def reset_assignments():
     with _assignments_lock:
         _current_assignments.clear()
         save_assignments(_current_assignments)
-    emit("assignments", _current_assignments, broadcast=True)
+    socketio.emit("assignments", _current_assignments)
+
+
+@app.post("/auto_assign")
+def auto_assign() -> Response:
+    initialize_state()
+    if _grid_error:
+        return jsonify({"error": _grid_error}), 400
+    if not SECTORS_GEOJSON.exists():
+        return jsonify({"error": "Сетка ещё не сформирована"}), 400
+    try:
+        features = json.loads(SECTORS_GEOJSON.read_text(encoding="utf-8")).get("features", [])
+    except (OSError, json.JSONDecodeError) as exc:
+        message = f"Не удалось прочитать сетку: {exc}"
+        set_grid_error(message)
+        return jsonify({"error": message}), 500
+    tractors = tractors_for_settings(with_settings_copy())
+    if not tractors:
+        return jsonify({"error": "Список тракторов пуст"}), 400
+    import random
+
+    assignments: Dict[str, str] = {}
+    for feature in features:
+        sector_id = feature.get("properties", {}).get("id") if isinstance(feature, dict) else None
+        if not sector_id:
+            continue
+        tractor = random.choice(tractors)
+        assignments[str(sector_id)] = tractor["id"]
+    with _assignments_lock:
+        _current_assignments.clear()
+        _current_assignments.update(assignments)
+        save_assignments(_current_assignments)
+    socketio.emit("assignments", _current_assignments)
+    return jsonify({"success": True, "assigned": len(assignments)})
+
+
+@app.route("/routes_grid.kml")
+def routes_kml_raw() -> Response:
+    if not ROUTES_KML.exists():
+        return jsonify({"error": "routes_grid.kml ещё не создан"}), 404
+    return send_file(ROUTES_KML, mimetype="application/vnd.google-earth.kml+xml")
+
+
+@app.errorhandler(Exception)
+def handle_error(exc):  # noqa: ANN001
+    from werkzeug.exceptions import HTTPException
+
+    if isinstance(exc, HTTPException):
+        return exc
+    import traceback
+
+    app.logger.error("Необработанная ошибка: %s", traceback.format_exc())
+    return jsonify({"error": str(exc)}), 500
 
 
 def main() -> None:
