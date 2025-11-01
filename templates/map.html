@@ -410,7 +410,8 @@
       let kmlReady = false;
       let isBuilding = false;
       let gridErrorMessage = "";
-      let routesLayer = null;
+      let routeLayer = null;
+      let focusRouteLayerOnUpdate = false;
       rebuildTractorControls(tractorList);
       applySettingsSummary();
       updateGridIndicators();
@@ -426,9 +427,9 @@
         recolorAll();
         kmlReady = false;
         updateActionButtons();
-        if (routesLayer) {
-          map.removeLayer(routesLayer);
-          routesLayer = null;
+        if (routeLayer) {
+          map.removeLayer(routeLayer);
+          routeLayer = null;
         }
       });
 
@@ -442,14 +443,19 @@
         recolorSector(sector_id);
         kmlReady = false;
         updateActionButtons();
-        if (routesLayer) {
-          map.removeLayer(routesLayer);
-          routesLayer = null;
+        if (routeLayer) {
+          map.removeLayer(routeLayer);
+          routeLayer = null;
         }
       });
 
       socket.on("progress", ({ message }) => {
         appendLog(message);
+      });
+
+      socket.on("partial_kml_update", () => {
+        refreshRouteLayer({ focusOnBounds: focusRouteLayerOnUpdate });
+        focusRouteLayerOnUpdate = false;
       });
 
       socket.on("build_status", ({ running }) => {
@@ -458,9 +464,9 @@
           kmlReady = false;
         }
         updateActionButtons();
-        if (running && routesLayer) {
-          map.removeLayer(routesLayer);
-          routesLayer = null;
+        if (running && routeLayer) {
+          map.removeLayer(routeLayer);
+          routeLayer = null;
         }
       });
 
@@ -471,40 +477,14 @@
 
       socket.on("build_done", ({ success }) => {
         isBuilding = false;
+        kmlReady = false;
         updateActionButtons();
         if (success) {
-          appendLog("Маршруты готовы, добавляю слой...");
-          fetch("/routes_grid.kml")
-            .then((resp) => {
-              if (!resp.ok) {
-                throw new Error(`HTTP ${resp.status}`);
-              }
-              return resp.text();
-            })
-            .then((kmlText) => {
-              if (routesLayer) {
-                map.removeLayer(routesLayer);
-              }
-              const parser = new DOMParser();
-              const kml = parser.parseFromString(kmlText, "text/xml");
-              routesLayer = new L.KML(kml);
-              routesLayer.addTo(map);
-              const bounds = routesLayer.getBounds();
-              if (bounds && bounds.isValid()) {
-                map.fitBounds(bounds, { padding: [40, 40] });
-              }
-              kmlReady = true;
-              updateActionButtons();
-            })
-            .catch((error) => {
-              appendLog(`Не удалось загрузить маршруты: ${error.message}`);
-              kmlReady = false;
-              updateActionButtons();
-            });
+          appendLog("📍 Маршруты построены — показываю итоговый слой...");
+          focusRouteLayerOnUpdate = true;
+          socket.emit("partial_kml_update");
         } else {
-          appendLog("Построение маршрутов завершилось с ошибкой.");
-          kmlReady = false;
-          updateActionButtons();
+          appendLog("❌ Ошибка при построении маршрутов");
         }
       });
 
@@ -602,13 +582,49 @@
         }
       }
 
+      function refreshRouteLayer({ focusOnBounds = false } = {}) {
+        if (!window.L || typeof L.KML !== "function") {
+          return;
+        }
+        fetch("/routes_grid.kml")
+          .then((resp) => {
+            if (!resp.ok) {
+              throw new Error(`HTTP ${resp.status}`);
+            }
+            return resp.text();
+          })
+          .then((kmlText) => {
+            if (!kmlText.trim()) {
+              return;
+            }
+            const parser = new DOMParser();
+            const kml = parser.parseFromString(kmlText, "text/xml");
+            if (routeLayer) {
+              map.removeLayer(routeLayer);
+            }
+            routeLayer = new L.KML(kml);
+            routeLayer.addTo(map);
+            const bounds = routeLayer.getBounds?.();
+            if (focusOnBounds && bounds && bounds.isValid()) {
+              map.fitBounds(bounds, { padding: [40, 40] });
+            }
+            if (!isBuilding) {
+              kmlReady = true;
+              updateActionButtons();
+            }
+          })
+          .catch((error) => {
+            console.warn("Ошибка обновления маршрутов", error);
+          });
+      }
+
       function setGridError(message, options = {}) {
         const trimmed = (message || "").toString().trim();
         const changed = gridErrorMessage !== trimmed;
         gridErrorMessage = trimmed;
-        if (trimmed && routesLayer) {
-          map.removeLayer(routesLayer);
-          routesLayer = null;
+        if (trimmed && routeLayer) {
+          map.removeLayer(routeLayer);
+          routeLayer = null;
           kmlReady = false;
         }
         if (gridErrorBanner) {
@@ -709,9 +725,9 @@
             socket.emit("assign_sector", { sector_id: sectorId, tractor_id: null });
           }
         });
-        if (routesLayer) {
-          map.removeLayer(routesLayer);
-          routesLayer = null;
+        if (routeLayer) {
+          map.removeLayer(routeLayer);
+          routeLayer = null;
         }
       });
 
@@ -721,9 +737,9 @@
         Object.keys(assignments).forEach((key) => delete assignments[key]);
         recolorAll();
         socket.emit("assignments_reset", {});
-        if (routesLayer) {
-          map.removeLayer(routesLayer);
-          routesLayer = null;
+        if (routeLayer) {
+          map.removeLayer(routeLayer);
+          routeLayer = null;
         }
       });
 
@@ -740,6 +756,15 @@
                 throw new Error(data?.error || "Не удалось выполнить автораспределение");
               }
               appendLog(`Автораспределение завершено: ${data.assigned || 0} клеток`);
+              if (Array.isArray(data?.clusters)) {
+                data.clusters.forEach((cluster) => {
+                  if (!cluster?.tractor || !Array.isArray(cluster?.center)) return;
+                  const [lon, lat] = cluster.center;
+                  appendLog(
+                    `→ ${cluster.tractor}: центр ${Number(lat).toFixed(5)}, ${Number(lon).toFixed(5)}`,
+                  );
+                });
+              }
             })
             .catch((error) => {
               appendLog(`Ошибка автораспределения: ${error.message}`);
@@ -782,10 +807,11 @@
       buildBtn.addEventListener("click", () => {
         isBuilding = true;
         kmlReady = false;
+        focusRouteLayerOnUpdate = false;
         updateActionButtons();
-        if (routesLayer) {
-          map.removeLayer(routesLayer);
-          routesLayer = null;
+        if (routeLayer) {
+          map.removeLayer(routeLayer);
+          routeLayer = null;
         }
         appendLog("Запускаю построение маршрутов...");
         fetch("/run", {
@@ -892,10 +918,31 @@
         sectorLayers.forEach((_layer, sectorId) => recolorSector(sectorId));
       }
 
-      function appendLog(message) {
+      function appendLog(text) {
+        if (!logEl) {
+          return;
+        }
+        const message = (text ?? "").toString();
         const time = new Date().toLocaleTimeString();
-        const prefix = logEl.textContent.trim() ? "\n" : "";
-        logEl.textContent += `${prefix}[${time}] ${message}`;
+        let color = "#263238";
+        const lowered = message.toLowerCase();
+        if (lowered.includes("ошибка") || message.includes("❌")) {
+          color = "#b71c1c";
+        } else if (message.includes("✅") || message.includes("📍")) {
+          color = "#1b5e20";
+        } else if (
+          message.includes("🚀") ||
+          message.includes("📘") ||
+          message.includes("🔹") ||
+          message.includes("⚙️") ||
+          message.includes("💾")
+        ) {
+          color = "#1565c0";
+        }
+        const entry = document.createElement("div");
+        entry.style.color = color;
+        entry.innerHTML = `[${time}] ${message}`;
+        logEl.appendChild(entry);
         logEl.scrollTop = logEl.scrollHeight;
       }
     </script>

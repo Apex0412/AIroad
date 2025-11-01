@@ -8,9 +8,12 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import numpy as np
+
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from flask_socketio import SocketIO, emit
+from sklearn.cluster import KMeans
 
 from config_defaults import BuildDefaults, GRID_CELL_OPTIONS, TRACTOR_COLORS
 
@@ -417,8 +420,19 @@ def _background_build() -> None:
     try:
         refresh_env()
         settings_snapshot = with_settings_copy()
-        ensure_grid_exists(settings_snapshot.get("grid_cells"), force=True)
-        set_grid_error(None)
+        socketio.emit("build_status", {"running": True})
+        socketio.emit("progress", {"message": "🚀 Запуск маршрутизации..."})
+
+        try:
+            ensure_grid_exists(settings_snapshot.get("grid_cells"), force=True)
+            set_grid_error(None)
+        except Exception as ensure_exc:  # noqa: BLE001
+            message = f"❌ Ошибка подготовки сетки: {ensure_exc}"
+            socketio.emit("progress", {"message": message})
+            set_grid_error(str(ensure_exc))
+            socketio.emit("build_done", {"success": False})
+            return
+
         args = [
             sys.executable,
             str(APP_ROOT / "route_builder_grid_v7_1.py"),
@@ -449,22 +463,10 @@ def _background_build() -> None:
             "--center-lon",
             str(settings_snapshot["center_lon"]),
         ]
-        if settings_snapshot.get("use_base_as_start", True):
+        if _coerce_bool(settings_snapshot.get("use_base_as_start")):
             args.append("--use-base-start")
         else:
             args.append("--no-use-base-start")
-        app.logger.info("Запускаю построение маршрутов")
-        socketio.emit("build_status", {"running": True})
-        socketio.emit("progress", {"message": "🚜 Запуск маршрутизации..."})
-        try:
-            ensure_grid_exists(settings_snapshot.get("grid_cells"), force=True)
-            set_grid_error(None)
-        except Exception as ensure_exc:  # noqa: BLE001
-            message = f"❌ Ошибка подготовки сетки: {ensure_exc}"
-            socketio.emit("progress", {"message": message})
-            set_grid_error(str(ensure_exc))
-            socketio.emit("build_done", {"success": False})
-            return
 
         process = subprocess.Popen(
             args,
@@ -475,19 +477,46 @@ def _background_build() -> None:
             bufsize=1,
         )
         assert process.stdout is not None
+
+        stage_keywords = {
+            "Чтение входных файлов": "📘 Загружаю исходные файлы",
+            "Кластеризация": "🔹 Распределяю линии по тракторам",
+            "Построение маршрутов": "⚙️ Строю маршруты",
+            "Экспорт": "💾 Сохраняю результат",
+        }
+        seen_stages: set[str] = set()
+        last_kml_mtime: Optional[float] = None
+        if ROUTES_KML.exists():
+            last_kml_mtime = ROUTES_KML.stat().st_mtime
+
         for line in iter(process.stdout.readline, ""):
             cleaned = _ansi_regex.sub("", line).strip()
             if not cleaned:
                 continue
+            lowered = cleaned.lower()
+            for keyword, message in stage_keywords.items():
+                if keyword.lower() in lowered and keyword not in seen_stages:
+                    seen_stages.add(keyword)
+                    socketio.emit("progress", {"message": message})
+                    break
             socketio.emit("progress", {"message": cleaned})
+
+            if ROUTES_KML.exists():
+                current_mtime = ROUTES_KML.stat().st_mtime
+                if last_kml_mtime is None or current_mtime > last_kml_mtime:
+                    last_kml_mtime = current_mtime
+                    socketio.emit("partial_kml_update")
+
         returncode = process.wait()
         if returncode == 0:
             socketio.emit("progress", {"message": "✅ Маршруты построены"})
             socketio.emit("build_done", {"success": True})
+            if ROUTES_KML.exists():
+                socketio.emit("partial_kml_update")
         else:
             socketio.emit(
                 "progress",
-                {"message": f"❌ Ошибка subprocess: код {returncode}"},
+                {"message": f"❌ Ошибка subprocess ({returncode})"},
             )
             socketio.emit("build_done", {"success": False})
     except Exception as exc:  # noqa: BLE001
@@ -638,37 +667,89 @@ def reset_assignments():
     socketio.emit("assignments", _current_assignments)
 
 
+@socketio.on("partial_kml_update")
+def handle_partial_kml_update():
+    """Отдаёт сигнал клиентам обновить слой маршрутов."""
+
+    if ROUTES_KML.exists():
+        socketio.emit("partial_kml_update")
+
+
 @app.post("/auto_assign")
 def auto_assign() -> Response:
+    """Кластерное распределение клеток по тракторам."""
+
     initialize_state()
     if _grid_error:
         return jsonify({"error": _grid_error}), 400
     if not SECTORS_GEOJSON.exists():
         return jsonify({"error": "Сетка ещё не сформирована"}), 400
     try:
-        features = json.loads(SECTORS_GEOJSON.read_text(encoding="utf-8")).get("features", [])
+        payload = json.loads(SECTORS_GEOJSON.read_text(encoding="utf-8"))
+        features = payload.get("features", []) if isinstance(payload, dict) else []
     except (OSError, json.JSONDecodeError) as exc:
         message = f"Не удалось прочитать сетку: {exc}"
         set_grid_error(message)
         return jsonify({"error": message}), 500
+
     tractors = tractors_for_settings(with_settings_copy())
     if not tractors:
-        return jsonify({"error": "Список тракторов пуст"}), 400
-    import random
+        return jsonify({"error": "Нет тракторов"}), 400
+    if not features:
+        return jsonify({"error": "Сетка не содержит полигонов"}), 400
+
+    coords: list[list[float]] = []
+    cell_ids: list[str] = []
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        props = feature.get("properties") or {}
+        geometry = feature.get("geometry") or {}
+        sector_id = props.get("id")
+        if not sector_id or not isinstance(geometry, dict):
+            continue
+        geom_type = geometry.get("type")
+        try:
+            if geom_type == "Polygon":
+                ring = geometry["coordinates"][0]
+            elif geom_type == "MultiPolygon":
+                ring = geometry["coordinates"][0][0]
+            else:
+                continue
+            xs, ys = zip(*ring)
+        except Exception:  # noqa: BLE001
+            continue
+        lon = float(np.mean(xs))
+        lat = float(np.mean(ys))
+        coords.append([lon, lat])
+        cell_ids.append(str(sector_id))
+
+    if not coords:
+        return jsonify({"error": "Не удалось вычислить центроиды клеток"}), 500
+
+    if len(coords) < len(tractors):
+        return jsonify({"error": "Клеток меньше, чем тракторов"}), 400
+
+    matrix = np.array(coords)
+    kmeans = KMeans(n_clusters=len(tractors), n_init="auto", random_state=42)
+    labels = kmeans.fit_predict(matrix)
 
     assignments: Dict[str, str] = {}
-    for feature in features:
-        sector_id = feature.get("properties", {}).get("id") if isinstance(feature, dict) else None
-        if not sector_id:
-            continue
-        tractor = random.choice(tractors)
-        assignments[str(sector_id)] = tractor["id"]
+    for index, sector_id in enumerate(cell_ids):
+        tractor = tractors[labels[index]]
+        assignments[sector_id] = tractor["id"]
+
     with _assignments_lock:
         _current_assignments.clear()
         _current_assignments.update(assignments)
         save_assignments(_current_assignments)
+
     socketio.emit("assignments", _current_assignments)
-    return jsonify({"success": True, "assigned": len(assignments)})
+    centers = [
+        {"tractor": tractors[i]["name"], "center": kmeans.cluster_centers_[i].tolist()}
+        for i in range(len(tractors))
+    ]
+    return jsonify({"success": True, "assigned": len(assignments), "clusters": centers})
 
 
 @app.route("/routes_grid.kml")

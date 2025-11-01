@@ -597,6 +597,7 @@ def distribute_remaining_segments(
 
 
 def write_routes_kml(routes: Sequence[RouteResult], output_path: Path) -> None:
+    print_stage("Экспорт маршрутов в routes_grid.kml")
     kml = simplekml.Kml()
     for idx, route in enumerate(routes):
         placemark = kml.newlinestring(name=route.tractor_id)
@@ -736,6 +737,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             + Style.RESET_ALL
         )
 
+    print_stage("Чтение входных файлов: GEO.kml и RoadCity.kml")
     try:
         zone = parse_geo_boundary(args.geo)
         cells = build_grid(zone, settings.grid_cells)
@@ -751,12 +753,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     try:
         segments = parse_roads(args.roads, zone)
         map_segments_to_cells(segments, cells)
+        print_stage("Кластеризация линий по назначенным клеткам")
     except Exception as exc:  # noqa: BLE001
         print_stage(Fore.RED + f"Ошибка подготовки дорог: {exc}" + Style.RESET_ALL)
         raise
 
     try:
         assignments = load_assignments(args.assignments)
+        print_stage("Построение маршрутов для тракторов")
         build_routes_with_assignments(segments, cells, assignments, args.output, settings)
     except Exception as exc:  # noqa: BLE001
         print_stage(Fore.RED + f"Ошибка построения маршрутов: {exc}" + Style.RESET_ALL)
