@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import threading
 from datetime import datetime
 from typing import Dict, List
@@ -29,17 +28,17 @@ from config import (
     save_settings as config_save_settings,
 )
 from route_builder import TRACTOR_COLORS
-from route_builder.grid import generate_grid, load_geo_boundary, save_grid_geojson
-from route_builder.optimizer import (
-    Tractor,
-    assign_cells_kmeans,
-    assign_roads_advanced,
-    assign_roads_simple,
+from services import state as state_store
+from services.assign import (
+    auto_assign_cells,
+    auto_assign_roads,
+    load_cell_assignments,
 )
-from route_builder.roads import load_roads
-from utils.progress import emit_progress, init_progress, run_async
+from services.kml_io import build_grid, load_grid_file, read_roads_kml, read_zone_kml
+from services.routing import build_routes
+from services.tasks import run_async
+from utils.progress import emit_progress, init_progress
 from utils.validator import validate_geo_kml
-import subprocess
 
 load_dotenv(APP_ROOT / ".env", override=True)
 
@@ -49,6 +48,8 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 
 _session_log: List[str] = []
 _log_file_path = None
+
+STATE = state_store.STATE
 
 
 def _timestamp() -> str:
@@ -105,6 +106,9 @@ def _nearest_distance_km(lat: float, lon: float, roads) -> float | None:
 def load_settings() -> Dict[str, object]:
     base_lat_env = os.getenv("BASE_LAT") or os.getenv("CENTER_LAT", "54.920031")
     base_lon_env = os.getenv("BASE_LON") or os.getenv("CENTER_LON", "37.408090")
+    street_source_env = os.getenv("STREETS_PROVIDER") or os.getenv("STREET_SOURCE", "google")
+    routing_provider_env = os.getenv("ROUTES_PROVIDER") or os.getenv("ROUTING_PROVIDER", "google")
+
     defaults = {
         "grid_cells": 64,
         "n_units": 18,
@@ -118,10 +122,10 @@ def load_settings() -> Dict[str, object]:
         "use_base_as_start": os.getenv("USE_BASE_BY_DEFAULT", "true").lower() == "true",
         "request_pause": float(os.getenv("REQUEST_PAUSE", "0.35")),
         "sample_every_m": float(os.getenv("SAMPLE_EVERY_M", "150")),
-        "street_source": os.getenv("STREET_SOURCE", "google"),
+        "street_source": street_source_env,
         "advanced": os.getenv("ADVANCED_OPTIMIZATION", "false").lower() == "true",
         "mode": "grid" if os.getenv("USE_GRID_BY_DEFAULT", "true").lower() == "true" else "road",
-        "routing_provider": os.getenv("ROUTING_PROVIDER", "google"),
+        "routing_provider": routing_provider_env,
         "validate_coord_order": os.getenv("VALIDATE_COORD_ORDER", "true").lower() == "true",
     }
     return config_load_settings(defaults)
@@ -190,15 +194,16 @@ def _grid_build_worker(grid_cells: int) -> None:
     if not _grid_build_lock.acquire(blocking=False):
         return
     try:
-        emit_progress("grid", f"Читаю GEO.kml…", 5)
-        boundary = load_geo_boundary(GEO_PATH)
+        emit_progress("grid", "Читаю GEO.kml…", 5)
+        boundary = read_zone_kml(GEO_PATH)
         emit_progress("grid", f"Генерирую сетку на {grid_cells} клеток…", 40)
-        cells = generate_grid(boundary, grid_cells)
-        emit_progress("grid", f"Сохраняю GeoJSON ({len(cells)} клеток)…", 75)
-        save_grid_geojson(cells, GRID_GEOJSON, grid_cells)
+        data = build_grid(boundary, grid_cells)
+        emit_progress(
+            "grid", f"Сохраняю GeoJSON ({len(data.get('features', []))} клеток)…", 75
+        )
         _roads_cache = None
         _grid_error = None
-        data = json.loads(GRID_GEOJSON.read_text(encoding="utf-8"))
+        # if build_grid already saved file, data already read
         socketio.emit("grid_error", {"message": None})
         socketio.emit("grid_ready", {"cells": len(data.get("features", []))})
         socketio.emit("grid_updated", data)
@@ -212,16 +217,7 @@ def _grid_build_worker(grid_cells: int) -> None:
 
 
 def load_assignments() -> Dict[str, str]:
-    if not ASSIGNMENTS_JSON.exists():
-        return {}
-    try:
-        payload = json.loads(ASSIGNMENTS_JSON.read_text(encoding="utf-8"))
-        if isinstance(payload, dict) and "assignments" in payload:
-            return dict(payload.get("assignments") or {})
-        if isinstance(payload, dict):
-            return payload
-    except Exception:
-        return {}
+    return load_cell_assignments()
 
 
 def _ensure_roads_geojson():
@@ -234,8 +230,8 @@ def _ensure_roads_geojson():
         return None
     try:
         emit_progress("roads", "Читаю RoadCity.kml…", 60)
-        boundary = load_geo_boundary(GEO_PATH)
-        roads = load_roads(ROADS_PATH, boundary)
+        boundary = read_zone_kml(GEO_PATH)
+        roads = read_roads_kml(ROADS_PATH, boundary)
     except Exception as exc:
         _emit_log(f"[{_timestamp()}] [ROADS] ⚠️ Не удалось загрузить дороги: {exc}")
         emit_progress("roads", f"⚠️ Не удалось загрузить дороги: {exc}", 60)
@@ -403,13 +399,13 @@ def _auto_assign_task(
                         {"cell_id": cell_id, "tractor": tractor_id},
                     )
 
-            assignments, summary = assign_cells_kmeans(
+            assignments, summary = auto_assign_cells(
                 features,
                 tractors,
                 advanced=advanced,
                 roads=roads_for_cells,
-                progress_callback=progress_cb,
-                step_callback=cell_cb,
+                progress_cb=progress_cb,
+                step_cb=cell_cb,
             )
             with _auto_assign_lock:
                 _assignments.clear()
@@ -429,15 +425,16 @@ def _auto_assign_task(
             emit_progress("assign", "Запускаю автораспределение дорог", 10)
             global _roads_cache
             _roads_cache = None
-            boundary = load_geo_boundary(GEO_PATH)
-            roads = load_roads(ROADS_PATH, boundary)
-            if advanced:
-                assignments, stats, summary = assign_roads_advanced(
-                    roads,
-                    tractors,
-                    float(_current_settings.get("target_km", 30_000.0)),
-                    street_source=street_source,
-                )
+            boundary = read_zone_kml(GEO_PATH)
+            roads = read_roads_kml(ROADS_PATH, boundary)
+            assignments, stats, summary = auto_assign_roads(
+                roads,
+                tractors,
+                advanced=advanced,
+                target_km=float(_current_settings.get("target_km", 30_000.0)),
+                street_source=street_source,
+            )
+            if summary:
                 DATA_DIR.joinpath("street_summary.csv").write_text(
                     "Трактор;Улица;Длина,м\n"
                     + "\n".join(
@@ -445,9 +442,6 @@ def _auto_assign_task(
                     ),
                     encoding="utf-8",
                 )
-            else:
-                assignments, stats = assign_roads_simple(roads, tractors)
-                summary = []
             ROADS_ASSIGN_JSON.write_text(
                 json.dumps(assignments, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -541,165 +535,8 @@ def _background_build() -> None:
     socketio.emit("build_status", {"running": True})
     try:
         emit_progress("route", "🚀 Запуск маршрутизации…", 5)
-        base_lat = float(_current_settings.get("base_lat", 0.0))
-        base_lon = float(_current_settings.get("base_lon", 0.0))
-        emit_progress("base", "Проверяю координаты базы…", 8)
-        _emit_log(f"[{_timestamp()}] [BASE] Старт маршрутов от базы: {base_lat:.6f}, {base_lon:.6f}")
-        if GEO_PATH.exists() and ROADS_PATH.exists():
-            try:
-                boundary = load_geo_boundary(GEO_PATH)
-                roads = load_roads(ROADS_PATH, boundary)
-                if roads:
-                    base_point = Point(base_lon, base_lat)
-                    nearest = min((road.geometry.distance(base_point) for road in roads), default=0.0)
-                    nearest_km = nearest * 111.139
-                    _emit_log(
-                        f"[{_timestamp()}] [DEBUG] Проверено расстояние до ближайшей линии: {nearest_km:.2f} км"
-                    )
-                    if (
-                        nearest_km > 30
-                        and bool(_current_settings.get("validate_coord_order", True))
-                    ):
-                        swapped_point = Point(base_lat, base_lon)
-                        swapped = min((road.geometry.distance(swapped_point) for road in roads), default=nearest)
-                        swapped_km = swapped * 111.139
-                        if swapped_km < nearest_km:
-                            _emit_log(
-                                f"[{_timestamp()}] [BASE] Обнаружена возможная перестановка широты/долготы — исправляю"
-                            )
-                            _current_settings["base_lat"], _current_settings["base_lon"] = (
-                                float(base_lon),
-                                float(base_lat),
-                            )
-                            base_lat = float(_current_settings["base_lat"])
-                            base_lon = float(_current_settings["base_lon"])
-                            save_settings(_current_settings)
-                            socketio.emit("settings", {"settings": _current_settings})
-                            nearest_km = swapped_km
-                            _emit_log(
-                                f"[{_timestamp()}] [BASE] Новые координаты базы: {base_lat:.6f}, {base_lon:.6f}"
-                            )
-                    if nearest_km > 100:
-                        emit_progress("route", "⚠️ [ROUTE ERROR] Координаты базы вне зоны или перепутаны", 15)
-                    elif nearest_km > 10:
-                        emit_progress(
-                            "route",
-                            "⚠️ Нет дорог рядом с базой, проверь координаты",
-                            15,
-                        )
-            except Exception as exc:
-                _emit_log(f"[{_timestamp()}] [BASE] Не удалось проверить координаты: {exc}")
-        args = [
-            sys.executable,
-            str(APP_ROOT / "route_builder_grid_v7_1.py"),
-            "--geo",
-            str(GEO_PATH),
-            "--roads",
-            str(ROADS_PATH),
-            "--roads-assignment",
-            str(ROADS_ASSIGN_JSON),
-            "--output",
-            str(ROUTES_KML),
-            "--grid-cells",
-            str(_current_settings.get("grid_cells", 64)),
-            "--n-units",
-            str(_current_settings.get("n_units", 18)),
-            "--target-km",
-            str(_current_settings.get("target_km", 30000.0)),
-            "--travel-mode",
-            str(_current_settings.get("travel_mode", "driving")),
-            "--max-waypoints",
-            str(_current_settings.get("max_waypoints", 23)),
-            "--base-lat",
-            str(_current_settings.get("base_lat", 0.0)),
-            "--base-lon",
-            str(_current_settings.get("base_lon", 0.0)),
-            "--center-lat",
-            str(_current_settings.get("center_lat", 0.0)),
-            "--center-lon",
-            str(_current_settings.get("center_lon", 0.0)),
-            "--request-pause",
-            str(_current_settings.get("request_pause", 0.35)),
-            "--sample-every-m",
-            str(_current_settings.get("sample_every_m", 150.0)),
-            "--roads-colored",
-            str(ROADS_COLORED_KML),
-            "--provider",
-            str(_current_settings.get("routing_provider", "google")),
-        ]
-        if bool(_current_settings.get("use_base_as_start", True)):
-            args.append("--use-base-start")
-        process = subprocess.Popen(
-            args,
-            cwd=str(APP_ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        stage_keywords = {
-            "чтение": ("📘 Загружаю исходные файлы", 20),
-            "кластер": ("🔹 Распределяю участки", 45),
-            "построение": ("🛠 Строю маршруты", 70),
-            "экспорт": ("💾 Сохраняю результат", 90),
-        }
-        current_progress = 5
-        for raw_line in iter(process.stdout.readline, ""):
-            line = raw_line.strip()
-            if not line:
-                continue
-            if line.startswith("[STATUS]"):
-                _emit_log(line.split("]", 1)[1].strip())
-                continue
-            if line.startswith("[ROUTE_STEP]"):
-                payload = line.split("]", 1)[1].strip()
-                if "coords=" in payload:
-                    tractor_part, coords_part = payload.split("coords=", 1)
-                    tractor = tractor_part.replace("tractor=", "").strip()
-                    try:
-                        coords = json.loads(coords_part)
-                    except json.JSONDecodeError:
-                        continue
-                    if tractor and isinstance(coords, list):
-                        socketio.emit(
-                            "route_step",
-                            {
-                                "tractor_id": tractor,
-                                "polyline": coords,
-                            },
-                        )
-                continue
-            if line.startswith("[ROUTE_DONE]"):
-                _emit_log(line)
-                payload = line.split("]", 1)[1].strip()
-                info = {}
-                for chunk in payload.split():
-                    if "=" in chunk:
-                        key, value = chunk.split("=", 1)
-                        info[key] = value
-                socketio.emit("tractor_done", info)
-                continue
-            lowered = line.lower()
-            matched = False
-            for key, msg in stage_keywords.items():
-                if key in lowered:
-                    text, percent = msg
-                    current_progress = percent
-                    emit_progress("route", text, current_progress)
-                    matched = True
-                    break
-            if matched:
-                continue
-            _emit_log(line)
-        code = process.wait()
-        if code == 0:
-            emit_progress("route", "✅ Маршруты построены", 100)
-            socketio.emit("build_done", {"success": True})
-            if ROUTES_KML.exists():
-                socketio.emit("routes_ready", {})
-        else:
-            emit_progress("route", f"❌ Ошибка subprocess ({code})", 100)
-            socketio.emit("build_done", {"success": False})
+        build_routes(_current_settings, socketio)
+        socketio.emit("build_done", {"success": True})
     except Exception as exc:
         emit_progress("route", f"❌ Ошибка запуска: {exc}", 100)
         socketio.emit("build_done", {"success": False})
