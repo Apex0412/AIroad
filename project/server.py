@@ -65,6 +65,7 @@ load_dotenv(APP_ROOT / ".env", override=True)
 app = Flask(__name__, template_folder=str(APP_ROOT / "templates"), static_folder=str(APP_ROOT / "static"))
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "change_me")
 socketio = SocketIO(app, cors_allowed_origins="*")
+# // FIX: socket server initialised without broadcast flags; keep reference for new health reporting
 
 _session_log: List[str] = []
 _log_file_path = None
@@ -289,6 +290,59 @@ def _current_system_status() -> List[Dict[str, str]]:
     return statuses
 
 
+def _health_report() -> Dict[str, object]:
+    # // FIX: compile detailed diagnostics for the /api/health endpoint
+    report: Dict[str, object] = {"files": {}, "apis": {}, "settings": dict(_current_settings)}
+    overall_status = "ok"
+    boundary = None
+    try:
+        boundary = read_zone_kml(GEO_PATH)
+        poly_count = len(list(boundary.geoms)) if getattr(boundary, "geoms", None) else 1
+        report["files"]["geo"] = {"exists": True, "polygons": poly_count, "status": "ok"}
+    except Exception as exc:
+        overall_status = "warn"
+        report["files"]["geo"] = {
+            "exists": GEO_PATH.exists(),
+            "polygons": 0,
+            "status": "error",
+            "error": str(exc),
+        }
+    try:
+        roads = read_roads_kml(ROADS_PATH, boundary)
+        report["files"]["roads"] = {"exists": True, "lines": len(roads), "status": "ok"}
+    except Exception as exc:
+        overall_status = "warn"
+        report["files"]["roads"] = {
+            "exists": ROADS_PATH.exists(),
+            "lines": 0,
+            "status": "error",
+            "error": str(exc),
+        }
+    if GRID_GEOJSON.exists():
+        try:
+            grid_payload = json.loads(GRID_GEOJSON.read_text(encoding="utf-8"))
+            report["files"]["grid"] = {
+                "exists": True,
+                "cells": len(grid_payload.get("features", [])),
+                "status": "ok",
+            }
+        except Exception as exc:
+            overall_status = "warn"
+            report["files"]["grid"] = {
+                "exists": True,
+                "cells": 0,
+                "status": "error",
+                "error": str(exc),
+            }
+    else:
+        report["files"]["grid"] = {"exists": False, "cells": 0, "status": "warn"}
+    report["apis"]["google_directions"] = {"configured": bool(env_google_key())}
+    report["apis"]["yandex_geocoder"] = {"configured": bool(env_yandex_key())}
+    report["routes_ready"] = bool(STATE.routes_ready and ROUTES_KML.exists())
+    report["status"] = overall_status
+    return report
+
+
 def load_settings() -> Dict[str, object]:
     base_lat_env = os.getenv("BASE_LAT") or os.getenv("CENTER_LAT", "54.920031")
     base_lon_env = os.getenv("BASE_LON") or os.getenv("CENTER_LON", "37.408090")
@@ -494,6 +548,17 @@ def grid_geojson():
     return jsonify(json.loads(GRID_GEOJSON.read_text(encoding="utf-8")))
 
 
+@app.post("/grid/generate")
+def generate_grid_api():
+    # // FIX: allow the UI to force grid regeneration on demand
+    ensure_grid_exists(int(_current_settings.get("grid_cells", 64)), force=True)
+    if _grid_error:
+        return jsonify({"ok": False, "error": _grid_error}), 400
+    payload = json.loads(GRID_GEOJSON.read_text(encoding="utf-8"))
+    socketio.emit("grid_updated", payload)
+    return jsonify({"ok": True, "cells": len(payload.get("features", [])), "grid": payload})
+
+
 @app.get("/routes_grid.kml")
 def download_kml():
     if not ROUTES_KML.exists():
@@ -504,6 +569,12 @@ def download_kml():
         as_attachment=True,
         download_name="routes_grid.kml",
     )
+
+
+# // FIX: provide REST-style export endpoint while keeping existing downloader
+@app.get("/export/kml")
+def export_kml():
+    return download_kml()
 
 
 @app.get("/roads")
@@ -565,6 +636,16 @@ def api_state():
     return jsonify(state_payload)
 
 
+@app.get("/api/health")
+def api_health():
+    report = _health_report()
+    # // FIX: surface aggregated diagnostics for the system check panel
+    _emit_log(
+        f"[{_timestamp()}] [TEST] GEO: {report['files'].get('geo', {}).get('status')} | ROADS: {report['files'].get('roads', {}).get('status')}"
+    )
+    return jsonify(report)
+
+
 @app.post("/settings")
 def update_settings():
     try:
@@ -622,6 +703,8 @@ def update_theme():
     return jsonify({"success": True, "theme": theme})
 
 
+# // FIX: expose legacy and new endpoints for auto assignment triggers
+@app.post("/assign/auto")
 @app.post("/auto_assign")
 def auto_assign():
     payload = request.get_json(silent=True) or {}
@@ -791,6 +874,8 @@ def check_base():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+# // FIX: support both legacy and RESTful endpoints for route builds
+@app.post("/routes/build")
 @app.post("/build_routes")
 def build_routes_endpoint():
     global _build_thread

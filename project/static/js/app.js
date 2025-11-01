@@ -659,7 +659,17 @@ function submitSettings() {
       if (data.error) throw new Error(data.error);
       appendLog('[SETTINGS] Настройки обновлены, обновляю сетку…');
       buildTractors();
-      showToast('Настройки сохранены, сетка обновится автоматически', 'info');
+      return fetch('/grid/generate', { method: 'POST' }); // FIX: force synchronous grid regeneration after settings save
+    })
+    .then((res) => (res ? res.json() : { ok: false, error: 'Нет ответа от сервера' }))
+    .then((gridResult) => {
+      if (gridResult && gridResult.ok === false) {
+        throw new Error(gridResult.error || 'Не удалось обновить сетку');
+      }
+      if (gridResult && gridResult.cells !== undefined) {
+        appendLog(`[GRID] Сетка построена: ${gridResult.cells} клеток`);
+      }
+      showToast('Настройки сохранены и сетка обновлена', 'info'); // FIX: confirm grid regeneration to user
     })
     .catch((err) => {
       appendLog(`[SETTINGS ERROR] ${err.message}`);
@@ -679,7 +689,7 @@ function autoAssign() {
   updateDownloadButton();
   updateStatsCard(null);
   resetAssignments();
-  fetch('/auto_assign', {
+  fetch('/assign/auto', { // FIX: route renamed to REST-style endpoint
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -712,7 +722,7 @@ function buildRoutes() {
   state.buildStartedAt = Date.now();
   updateDownloadButton();
   updateStatsCard(null);
-  fetch('/build_routes', { method: 'POST' })
+  fetch('/routes/build', { method: 'POST' }) // FIX: use new routes/build endpoint
     .then((res) => res.json())
     .then((data) => {
       if (data.error) throw new Error(data.error);
@@ -738,7 +748,7 @@ function disableDuringBuild(flag) {
 
 function downloadKml() {
   if (downloadButton && downloadButton.disabled) return;
-  window.open('/routes_grid.kml', '_blank');
+  window.open('/export/kml', '_blank'); // FIX: download via new export endpoint
 }
 
 function clearRoutes() {
@@ -793,6 +803,32 @@ async function runSystemCheck() {
       systemCheckBtn.textContent = systemCheckBtn.dataset.label;
       setBusy(systemCheckBtn, false);
       return;
+    }
+    const healthResponse = await fetch('/api/health'); // FIX: request aggregated diagnostics after triggering check
+    if (healthResponse.ok) {
+      const health = await healthResponse.json();
+      const items = [];
+      if (health.files) {
+        Object.entries(health.files).forEach(([key, value]) => {
+          items.push({
+            label: key.toUpperCase(),
+            status: value.status || 'warn',
+            message: value.error
+              ? value.error
+              : `объектов: ${value.polygons ?? value.lines ?? value.cells ?? 0}`,
+          });
+        });
+      }
+      if (health.apis) {
+        Object.entries(health.apis).forEach(([key, value]) => {
+          items.push({
+            label: key.replace('_', ' ').toUpperCase(),
+            status: value.configured ? 'ok' : 'warn',
+            message: value.configured ? 'ключ активен' : 'ключ отсутствует',
+          });
+        });
+      }
+      renderSystemStatus(items); // FIX: immediately reflect diagnostics in the status panel
     }
   } catch (error) {
     appendLog(`[SYSTEM] ⚠️ Не удалось запустить проверку: ${error.message}`);
@@ -1072,7 +1108,7 @@ socket.on('routes_ready', (data) => {
   if (statsData && (statsData.routes || statsData.total_km || statsData.lengths)) {
     updateStatsCard(statsData);
   }
-  fetch('/routes_grid.kml')
+  fetch('/export/kml') // FIX: refresh from new export endpoint
     .then((res) => res.text())
     .then((kmlText) => {
       if (kmlLayer) map.removeLayer(kmlLayer);
