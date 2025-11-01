@@ -404,14 +404,26 @@
       const targetSummary = document.getElementById("target-summary");
       const centerSummary = document.getElementById("center-summary");
 
+      const defaultRouteColors = [
+        "#e53935",
+        "#1e88e5",
+        "#43a047",
+        "#fdd835",
+        "#8e24aa",
+        "#fb8c00",
+        "#00acc1",
+      ];
+      const streamingPalette = Array.isArray(tractorPalette) && tractorPalette.length
+        ? tractorPalette
+        : defaultRouteColors;
       const tractorColors = {};
+      const routeLayers = {};
+      let finalKmlLayer = null;
       const gridErrorBanner = document.getElementById("grid-error-banner");
       const gridErrorText = document.getElementById("grid-error-text");
       let kmlReady = false;
       let isBuilding = false;
       let gridErrorMessage = "";
-      let routeLayer = null;
-      let focusRouteLayerOnUpdate = false;
       rebuildTractorControls(tractorList);
       applySettingsSummary();
       updateGridIndicators();
@@ -425,12 +437,7 @@
         Object.keys(assignments).forEach((key) => delete assignments[key]);
         Object.assign(assignments, data || {});
         recolorAll();
-        kmlReady = false;
-        updateActionButtons();
-        if (routeLayer) {
-          map.removeLayer(routeLayer);
-          routeLayer = null;
-        }
+        clearAllRoutes();
       });
 
       socket.on("assign_sector", ({ sector_id, tractor_id }) => {
@@ -441,21 +448,46 @@
           delete assignments[sector_id];
         }
         recolorSector(sector_id);
-        kmlReady = false;
-        updateActionButtons();
-        if (routeLayer) {
-          map.removeLayer(routeLayer);
-          routeLayer = null;
-        }
+        clearAllRoutes();
       });
 
       socket.on("progress", ({ message }) => {
         appendLog(message);
       });
 
+      socket.on("clear_routes", () => {
+        clearAllRoutes();
+      });
+
+      socket.on("route_point", ({ tractor, lat, lon }) => {
+        const tractorIndex = Number(tractor);
+        const latitude = Number(lat);
+        const longitude = Number(lon);
+        if (!Number.isFinite(tractorIndex) || !Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+          return;
+        }
+        const color = streamingPalette[(tractorIndex - 1) % streamingPalette.length] || "#1e88e5";
+        if (!routeLayers[tractorIndex]) {
+          routeLayers[tractorIndex] = L.polyline([], {
+            color,
+            weight: 4,
+            opacity: 0.85,
+          }).addTo(map);
+        }
+        routeLayers[tractorIndex].addLatLng([latitude, longitude]);
+      });
+
+      socket.on("tractor_done", ({ tractor }) => {
+        const tractorIndex = Number(tractor);
+        if (Number.isFinite(tractorIndex)) {
+          appendLog(`✅ Трактор ${tractorIndex.toString().padStart(2, "0")} завершил маршрут`);
+        } else {
+          appendLog("✅ Один из тракторов завершил маршрут");
+        }
+      });
+
       socket.on("partial_kml_update", () => {
-        refreshRouteLayer({ focusOnBounds: focusRouteLayerOnUpdate });
-        focusRouteLayerOnUpdate = false;
+        refreshRouteLayer({ focusOnBounds: false, keepStreaming: isBuilding });
       });
 
       socket.on("build_status", ({ running }) => {
@@ -464,9 +496,8 @@
           kmlReady = false;
         }
         updateActionButtons();
-        if (running && routeLayer) {
-          map.removeLayer(routeLayer);
-          routeLayer = null;
+        if (running) {
+          clearFinalRouteLayer();
         }
       });
 
@@ -481,8 +512,7 @@
         updateActionButtons();
         if (success) {
           appendLog("📍 Маршруты построены — показываю итоговый слой...");
-          focusRouteLayerOnUpdate = true;
-          socket.emit("partial_kml_update");
+          refreshRouteLayer({ focusOnBounds: true, keepStreaming: false });
         } else {
           appendLog("❌ Ошибка при построении маршрутов");
         }
@@ -507,8 +537,7 @@
         } else {
           setGridError(gridErrorMessage, { silent: true });
         }
-        kmlReady = false;
-        updateActionButtons();
+        clearAllRoutes();
         loadGeojson(true);
       });
 
@@ -582,7 +611,31 @@
         }
       }
 
-      function refreshRouteLayer({ focusOnBounds = false } = {}) {
+      function clearStreamingRoutes() {
+        Object.keys(routeLayers).forEach((key) => {
+          const layer = routeLayers[key];
+          if (layer && typeof layer.remove === "function") {
+            map.removeLayer(layer);
+          }
+          delete routeLayers[key];
+        });
+      }
+
+      function clearFinalRouteLayer() {
+        if (finalKmlLayer) {
+          map.removeLayer(finalKmlLayer);
+          finalKmlLayer = null;
+        }
+      }
+
+      function clearAllRoutes() {
+        clearStreamingRoutes();
+        clearFinalRouteLayer();
+        kmlReady = false;
+        updateActionButtons();
+      }
+
+      function refreshRouteLayer({ focusOnBounds = false, keepStreaming = false } = {}) {
         if (!window.L || typeof L.KML !== "function") {
           return;
         }
@@ -599,12 +652,13 @@
             }
             const parser = new DOMParser();
             const kml = parser.parseFromString(kmlText, "text/xml");
-            if (routeLayer) {
-              map.removeLayer(routeLayer);
+            if (!keepStreaming) {
+              clearStreamingRoutes();
             }
-            routeLayer = new L.KML(kml);
-            routeLayer.addTo(map);
-            const bounds = routeLayer.getBounds?.();
+            clearFinalRouteLayer();
+            finalKmlLayer = new L.KML(kml);
+            finalKmlLayer.addTo(map);
+            const bounds = finalKmlLayer.getBounds?.();
             if (focusOnBounds && bounds && bounds.isValid()) {
               map.fitBounds(bounds, { padding: [40, 40] });
             }
@@ -622,10 +676,8 @@
         const trimmed = (message || "").toString().trim();
         const changed = gridErrorMessage !== trimmed;
         gridErrorMessage = trimmed;
-        if (trimmed && routeLayer) {
-          map.removeLayer(routeLayer);
-          routeLayer = null;
-          kmlReady = false;
+        if (trimmed) {
+          clearAllRoutes();
         }
         if (gridErrorBanner) {
           if (trimmed) {
@@ -716,8 +768,7 @@
 
       clearBtn.addEventListener("click", () => {
         const tractorId = tractorSelect.value;
-        kmlReady = false;
-        updateActionButtons();
+        clearAllRoutes();
         Object.entries(assignments).forEach(([sectorId, assignedTo]) => {
           if (assignedTo === tractorId) {
             delete assignments[sectorId];
@@ -725,30 +776,20 @@
             socket.emit("assign_sector", { sector_id: sectorId, tractor_id: null });
           }
         });
-        if (routeLayer) {
-          map.removeLayer(routeLayer);
-          routeLayer = null;
-        }
       });
 
       resetBtn.addEventListener("click", () => {
-        kmlReady = false;
-        updateActionButtons();
+        clearAllRoutes();
         Object.keys(assignments).forEach((key) => delete assignments[key]);
         recolorAll();
         socket.emit("assignments_reset", {});
-        if (routeLayer) {
-          map.removeLayer(routeLayer);
-          routeLayer = null;
-        }
       });
 
       if (autoAssignBtn) {
         autoAssignBtn.addEventListener("click", () => {
           if (autoAssignBtn.disabled) return;
           appendLog("Запускаю автораспределение...");
-          kmlReady = false;
-          updateActionButtons();
+          clearAllRoutes();
           fetch("/auto_assign", { method: "POST" })
             .then((resp) => resp.json().then((data) => ({ ok: resp.ok, data })))
             .then(({ ok, data }) => {
@@ -779,8 +820,7 @@
             return;
           }
           appendLog(`Запрашиваю сетку на ${selected} клеток...`);
-          kmlReady = false;
-          updateActionButtons();
+          clearAllRoutes();
           submitSettings({ grid_cells: selected });
         });
       }
@@ -799,20 +839,14 @@
           grid_cells: gridSelect ? Number(gridSelect.value) : settingsState.grid_cells,
         };
         appendLog("Отправляю обновлённые параметры...");
-        kmlReady = false;
-        updateActionButtons();
+        clearAllRoutes();
         submitSettings(payload);
       });
 
       buildBtn.addEventListener("click", () => {
         isBuilding = true;
-        kmlReady = false;
-        focusRouteLayerOnUpdate = false;
+        clearAllRoutes();
         updateActionButtons();
-        if (routeLayer) {
-          map.removeLayer(routeLayer);
-          routeLayer = null;
-        }
         appendLog("Запускаю построение маршрутов...");
         fetch("/run", {
           method: "POST",
@@ -875,8 +909,7 @@
             if (Object.prototype.hasOwnProperty.call(data || {}, "grid_error")) {
               setGridError(data.grid_error);
             }
-            kmlReady = false;
-            updateActionButtons();
+            clearAllRoutes();
             loadGeojson(true);
           })
           .catch((error) => {
@@ -919,30 +952,24 @@
       }
 
       function appendLog(text) {
-        if (!logEl) {
-          return;
-        }
+        if (!logEl) return;
         const message = (text ?? "").toString();
         const time = new Date().toLocaleTimeString();
-        let color = "#263238";
-        const lowered = message.toLowerCase();
-        if (lowered.includes("ошибка") || message.includes("❌")) {
-          color = "#b71c1c";
+        let color = "black";
+        if (message.includes("Ошибка") || message.includes("❌")) {
+          color = "red";
         } else if (message.includes("✅") || message.includes("📍")) {
-          color = "#1b5e20";
+          color = "green";
         } else if (
           message.includes("🚀") ||
           message.includes("📘") ||
           message.includes("🔹") ||
-          message.includes("⚙️") ||
+          message.includes("🛠") ||
           message.includes("💾")
         ) {
-          color = "#1565c0";
+          color = "blue";
         }
-        const entry = document.createElement("div");
-        entry.style.color = color;
-        entry.innerHTML = `[${time}] ${message}`;
-        logEl.appendChild(entry);
+        logEl.innerHTML += `<div style="color:${color}">[${time}] ${message}</div>`;
         logEl.scrollTop = logEl.scrollHeight;
       }
     </script>

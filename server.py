@@ -433,6 +433,8 @@ def _background_build() -> None:
             socketio.emit("build_done", {"success": False})
             return
 
+        socketio.emit("clear_routes")
+
         args = [
             sys.executable,
             str(APP_ROOT / "route_builder_grid_v7_1.py"),
@@ -478,10 +480,10 @@ def _background_build() -> None:
         )
         assert process.stdout is not None
 
-        stage_keywords = {
-            "Чтение входных файлов": "📘 Загружаю исходные файлы",
-            "Кластеризация": "🔹 Распределяю линии по тракторам",
-            "Построение маршрутов": "⚙️ Строю маршруты",
+        stage_labels = {
+            "Чтение": "📘 Загружаю данные",
+            "Кластеризация": "🔹 Распределяю участки",
+            "Построение": "🛠 Строю маршруты",
             "Экспорт": "💾 Сохраняю результат",
         }
         seen_stages: set[str] = set()
@@ -493,12 +495,47 @@ def _background_build() -> None:
             cleaned = _ansi_regex.sub("", line).strip()
             if not cleaned:
                 continue
+            if cleaned.startswith("[ROUTE_STEP]"):
+                try:
+                    data_str = cleaned.split("]", 1)[1].strip()
+                    kv_pairs = {}
+                    for chunk in data_str.split():
+                        if "=" in chunk:
+                            key, value = chunk.split("=", 1)
+                            kv_pairs[key] = value
+                    tractor_val = int(kv_pairs.get("tractor", "0"))
+                    lat_val = float(kv_pairs.get("lat", "0"))
+                    lon_val = float(kv_pairs.get("lon", "0"))
+                except Exception as parse_exc:  # noqa: BLE001
+                    app.logger.debug("Не удалось распарсить шаг маршрута: %s (%s)", cleaned, parse_exc)
+                else:
+                    socketio.emit(
+                        "route_point",
+                        {"tractor": tractor_val, "lat": lat_val, "lon": lon_val},
+                    )
+                continue
+            if cleaned.startswith("[ROUTE_DONE]"):
+                try:
+                    data_str = cleaned.split("]", 1)[1].strip()
+                    parts = dict(
+                        chunk.split("=", 1) for chunk in data_str.split() if "=" in chunk
+                    )
+                    tractor_val = int(parts.get("tractor", "0"))
+                except Exception as parse_exc:  # noqa: BLE001
+                    app.logger.debug("Не удалось распарсить завершение маршрута: %s (%s)", cleaned, parse_exc)
+                else:
+                    socketio.emit("tractor_done", {"tractor": tractor_val})
+                    socketio.emit(
+                        "progress",
+                        {"message": f"✅ Трактор {tractor_val:02d} завершил маршрут"},
+                    )
+                continue
+
             lowered = cleaned.lower()
-            for keyword, message in stage_keywords.items():
+            for keyword, message in stage_labels.items():
                 if keyword.lower() in lowered and keyword not in seen_stages:
                     seen_stages.add(keyword)
                     socketio.emit("progress", {"message": message})
-                    break
             socketio.emit("progress", {"message": cleaned})
 
             if ROUTES_KML.exists():
@@ -506,6 +543,8 @@ def _background_build() -> None:
                 if last_kml_mtime is None or current_mtime > last_kml_mtime:
                     last_kml_mtime = current_mtime
                     socketio.emit("partial_kml_update")
+            elif "routes_grid.kml" in os.listdir(APP_ROOT):
+                socketio.emit("partial_kml_update")
 
         returncode = process.wait()
         if returncode == 0:

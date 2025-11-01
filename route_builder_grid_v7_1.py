@@ -104,6 +104,7 @@ class RouteResult:
     color: str
     coordinates: List[List[Tuple[float, float]]]
     total_length: float
+    tractor_index: int
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +119,24 @@ def print_stage(message: str) -> None:
     formatted = f"[{timestamp}] {message}"
     print(formatted)
     sys.stdout.flush()
+
+
+def emit_route_points(
+    tractor_index: int,
+    coords: Sequence[Tuple[float, float]],
+    *,
+    skip_first: bool = False,
+) -> None:
+    """Stream route polyline coordinates to stdout for live visualisation."""
+
+    if not coords:
+        return
+    sequence = list(coords)
+    start = 1 if skip_first else 0
+    for lon, lat in sequence[start:]:
+        print(f"[ROUTE_STEP] tractor={tractor_index} lat={lat} lon={lon}")
+    if start < len(sequence):
+        sys.stdout.flush()
 
 
 def load_kml_root(path: Path) -> ET.Element:
@@ -137,7 +156,7 @@ def parse_geo_boundary(path: Path) -> MultiPolygon:
     if not path.exists():
         raise FileNotFoundError(f"GEO boundary file not found: {path}")
 
-    print_stage("[1/8] Читаю границы GEO.kml")
+    print_stage("[1/8] Чтение границ GEO.kml")
     root = load_kml_root(path)
     ns = _kml_namespace(root)
 
@@ -171,7 +190,7 @@ def parse_roads(path: Path, zone: MultiPolygon) -> List[RoadSegment]:
     if not path.exists():
         raise FileNotFoundError(f"Road file not found: {path}")
 
-    print_stage("[2/8] Читаю дорожную сеть RoadCity.kml")
+    print_stage("[2/8] Чтение дорожной сети RoadCity.kml")
     root = load_kml_root(path)
     ns = _kml_namespace(root)
     segments: List[RoadSegment] = []
@@ -373,7 +392,7 @@ def build_routes_with_assignments(
     output_path: Path,
     settings: BuildSettings,
 ) -> List[RouteResult]:
-    print_stage("[6/8] Строю маршруты по назначенным клеткам")
+    print_stage("[6/8] Построение маршрутов по назначенным клеткам")
     assignments_by_tractor: Dict[str, List[str]] = {
         f"tractor_{i+1:02d}": [] for i in range(settings.n_units)
     }
@@ -440,13 +459,16 @@ def build_routes_with_assignments(
                 route_segments.append(travel_segment.copy())
                 travel_length = _line_length_m(travel_segment)
                 route_length += travel_length
+                emit_route_points(idx + 1, travel_segment, skip_first=len(route_segments) > 1)
                 current_point = travel_segment[-1]
 
             line_coords = list(next_segment.geometry.coords)
             if route_segments and route_segments[-1][-1] == line_coords[0]:
                 route_segments[-1].extend(line_coords[1:])
+                emit_route_points(idx + 1, line_coords, skip_first=True)
             else:
                 route_segments.append(line_coords)
+                emit_route_points(idx + 1, line_coords, skip_first=len(route_segments) > 1)
             route_length += next_segment.length_m
             current_point = line_coords[-1]
             unvisited.remove(next_segment.identifier)
@@ -457,11 +479,14 @@ def build_routes_with_assignments(
                 color=tractor_color,
                 coordinates=route_segments,
                 total_length=route_length,
+                tractor_index=idx + 1,
             )
         )
         print_stage(
             f"[6/8] {tractor_name}: длина {route_length/1000:.2f} км, осталось линий {len(unvisited)}"
         )
+        print(f"[ROUTE_DONE] tractor={idx + 1}")
+        sys.stdout.flush()
 
     if unvisited:
         print_stage(
@@ -585,12 +610,23 @@ def distribute_remaining_segments(
         if travel_segment:
             target_route.coordinates.append(travel_segment.copy())
             target_route.total_length += _line_length_m(travel_segment)
+            emit_route_points(
+                target_route.tractor_index,
+                travel_segment,
+                skip_first=len(target_route.coordinates) > 1,
+            )
 
         coords = list(segment.geometry.coords)
         if target_route.coordinates and target_route.coordinates[-1][-1] == coords[0]:
             target_route.coordinates[-1].extend(coords[1:])
+            emit_route_points(target_route.tractor_index, coords, skip_first=True)
         else:
             target_route.coordinates.append(coords)
+            emit_route_points(
+                target_route.tractor_index,
+                coords,
+                skip_first=len(target_route.coordinates) > 1,
+            )
         target_route.total_length += segment.length_m
     if hasattr(remaining_ids, "clear"):
         remaining_ids.clear()
