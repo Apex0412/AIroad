@@ -1,4 +1,8 @@
 {
   "type": "FeatureCollection",
-  "features": []
+  "features": [],
+  "metadata": {
+    "grid_cells": 0,
+    "generated_at": null
+  }
 }

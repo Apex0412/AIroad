@@ -181,11 +181,28 @@ def ensure_grid_exists(grid_cells: Optional[int] = None, force: bool = False) ->
     if not force and SECTORS_GEOJSON.exists():
         try:
             data = json.loads(SECTORS_GEOJSON.read_text(encoding="utf-8"))
-            meta = data.get("metadata", {})
-            if int(meta.get("grid_cells", desired_cells)) == desired_cells:
+        except (json.JSONDecodeError, OSError) as exc:
+            app.logger.info("Сетка повреждена, требуется перегенерация: %s", exc)
+        else:
+            features = data.get("features")
+            meta = data.get("metadata") if isinstance(data, dict) else None
+            stored_grid = None
+            if isinstance(meta, dict) and "grid_cells" in meta:
+                try:
+                    stored_grid = int(meta["grid_cells"])
+                except (TypeError, ValueError):
+                    stored_grid = None
+            if features and stored_grid == desired_cells:
                 return
-        except (ValueError, json.JSONDecodeError, OSError, AttributeError):
-            pass
+            reason = []
+            if not features:
+                reason.append("отсутствуют полигоны")
+            if stored_grid != desired_cells:
+                reason.append("другой размер сетки")
+            app.logger.info(
+                "Перегенерация сетки: %s",
+                "; ".join(reason) if reason else "требуется обновление",
+            )
     app.logger.info("Генерация сетки (%s клеток)...", desired_cells)
     args = [
         os.sys.executable,
