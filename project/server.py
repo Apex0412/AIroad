@@ -25,6 +25,7 @@ from route_builder.optimizer import (
     assign_roads_simple,
 )
 from route_builder.roads import load_roads
+from utils.validator import validate_geo_kml
 import subprocess
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -54,6 +55,12 @@ _current_settings: Dict[str, object] = {}
 _grid_error: str | None = None
 _assignments: Dict[str, str] = {}
 _roads_cache: dict | None = None
+
+
+def _emit_log(message: str) -> None:
+    payload = {"message": message}
+    socketio.emit("progress", payload)
+    socketio.emit("log", payload)
 
 
 def load_settings() -> Dict[str, object]:
@@ -105,6 +112,13 @@ def ensure_grid_exists(grid_cells: int, force: bool = False) -> None:
     if not GEO_PATH.exists():
         _grid_error = "Отсутствует GEO.kml в директории data/"
         socketio.emit("grid_error", {"message": _grid_error})
+        _emit_log(f"[{_timestamp()}] [GRID ERROR] {_grid_error}")
+        return
+    is_valid, err = validate_geo_kml(GEO_PATH)
+    if not is_valid:
+        _grid_error = err or "Некорректный GEO.kml"
+        socketio.emit("grid_error", {"message": _grid_error})
+        _emit_log(f"[{_timestamp()}] [GRID ERROR] {_grid_error}")
         return
     try:
         if GRID_PATH.exists() and not force:
@@ -113,23 +127,19 @@ def ensure_grid_exists(grid_cells: int, force: bool = False) -> None:
             if int(meta.get("grid_cells", grid_cells)) == grid_cells and data.get("features"):
                 _grid_error = None
                 socketio.emit("grid_error", {"message": None})
+                socketio.emit("grid_ready", {"cells": len(data.get("features", []))})
                 return
-        socketio.emit(
-            "progress",
-            {"message": f"[{_timestamp()}] 📘 Читаю GEO.kml и строю сетку на {grid_cells} клеток"},
-        )
+        _emit_log(f"[{_timestamp()}] [GRID] Читаю GEO.kml и строю сетку на {grid_cells} клеток")
         boundary = load_geo_boundary(GEO_PATH)
         cells = generate_grid(boundary, grid_cells)
         save_grid_geojson(cells, GRID_PATH, grid_cells)
         _grid_error = None
         socketio.emit("grid_error", {"message": None})
-        socketio.emit(
-            "progress",
-            {"message": f"[{_timestamp()}] ✅ Сетка обновлена ({len(cells)} клеток)"},
-        )
+        socketio.emit("grid_ready", {"cells": len(cells)})
+        _emit_log(f"[{_timestamp()}] [GRID] Сетка обновлена ({len(cells)} клеток)")
     except Exception as exc:
         _grid_error = str(exc)
-        socketio.emit("progress", {"message": f"[{_timestamp()}] ❌ Ошибка генерации сетки: {_grid_error}"})
+        _emit_log(f"[{_timestamp()}] [GRID ERROR] {_grid_error}")
         socketio.emit("grid_error", {"message": _grid_error})
 
 
@@ -147,16 +157,18 @@ def _ensure_roads_geojson():
     if _roads_cache is not None:
         return _roads_cache
     if not (ROADS_PATH.exists() and GEO_PATH.exists()):
+        _emit_log(f"[{_timestamp()}] [ROADS] ⚠️ RoadCity.kml или GEO.kml не найдены")
         return None
     try:
         boundary = load_geo_boundary(GEO_PATH)
         roads = load_roads(ROADS_PATH, boundary)
     except Exception as exc:
-        socketio.emit(
-            "progress",
-            {"message": f"[{_timestamp()}] ⚠️ Не удалось загрузить дороги: {exc}"},
-        )
+        _emit_log(f"[{_timestamp()}] [ROADS] ⚠️ Не удалось загрузить дороги: {exc}")
         return None
+    total_len = sum(road.geometry.length for road in roads) * 111_139
+    _emit_log(
+        f"[{_timestamp()}] [ROADS] Найдено {len(roads)} линий, общая длина {total_len/1000:.1f} км"
+    )
     features = []
     for road in roads:
         coords = [[lon, lat] for lon, lat in road.geometry.coords]
@@ -249,6 +261,8 @@ def update_settings():
     socketio.emit("settings", {"settings": _current_settings})
     if "grid_cells" in payload:
         ensure_grid_exists(int(payload["grid_cells"]), force=True)
+        if _grid_error:
+            return jsonify({"status": "error", "error": _grid_error}), 400
     return jsonify({"success": True, "settings": _current_settings})
 
 
@@ -276,11 +290,8 @@ def auto_assign():
                         "message": f"[{_timestamp()}] ⚠️ Не удалось загрузить дороги для оптимизации сетки: {exc}"
                     },
                 )
-        socketio.emit(
-            "progress",
-            {
-                "message": f"[{_timestamp()}] 🔀 Автораспределение сетки (advanced={advanced})",
-            },
+        _emit_log(
+            f"[{_timestamp()}] [ASSIGN] Автораспределение сетки (advanced={advanced})"
         )
         assignments, summary = assign_cells_kmeans(
             features["features"],
@@ -293,14 +304,9 @@ def auto_assign():
         ASSIGNMENTS_PATH.write_text(json.dumps(assignments, ensure_ascii=False, indent=2), encoding="utf-8")
         socketio.emit("assignments", assignments)
         for item in summary:
-            socketio.emit(
-                "progress",
-                {
-                    "message": (
-                        f"[{_timestamp()}] {item['tractor']}: {int(item['cells'])} клеток, "
-                        f"{item['area_km2']:.2f} км², дорог {item['roads_m']:.0f} м"
-                    )
-                },
+            _emit_log(
+                f"[{_timestamp()}] [ASSIGN] {item['tractor']} → {int(item['cells'])} клеток, "
+                f"{item['area_km2']:.2f} км², дорог {item['roads_m']:.0f} м"
             )
         return jsonify({"success": True, "assigned": len(assignments), "summary": summary})
     else:
@@ -328,15 +334,13 @@ def auto_assign():
             )
         else:
             assignments, stats = assign_roads_simple(roads, tractors)
+            summary = []
         ROADS_ASSIGN_PATH.write_text(json.dumps(assignments, ensure_ascii=False, indent=2), encoding="utf-8")
         socketio.emit("roads_assignment", assignments)
-        socketio.emit(
-            "progress",
-            {
-                "message": f"[{_timestamp()}] Автораспределение дорог завершено. {sum(stats.values()):.0f} м покрыто",
-            },
+        _emit_log(
+            f"[{_timestamp()}] [ASSIGN] Автораспределение дорог завершено. {sum(stats.values()):.0f} м покрыто"
         )
-        return jsonify({"success": True, "assigned": len(assignments)})
+        return jsonify({"success": True, "assigned": len(assignments), "summary": summary})
 
 
 @app.post("/build_routes")
@@ -349,6 +353,7 @@ def build_routes_endpoint():
     if not ROADS_ASSIGN_PATH.exists():
         return jsonify({"error": "Нет назначений дорог"}), 400
     socketio.emit("clear_routes", {})
+    _emit_log(f"[{_timestamp()}] [ROUTE] Очистка маршрутов и запуск расчёта")
     _build_thread = threading.Thread(target=_background_build, daemon=True)
     _build_thread.start()
     return jsonify({"success": True})
@@ -370,7 +375,7 @@ def _background_build() -> None:
         socketio.emit("progress", {"message": "Маршрутизатор уже запущен"})
         return
     try:
-        socketio.emit("progress", {"message": f"[{_timestamp()}] Запуск маршрутизации…"})
+        _emit_log(f"[{_timestamp()}] [ROUTE] Запуск маршрутизации…")
         args = [
             sys.executable,
             str(APP_ROOT / "route_builder_grid_v7_1.py"),
@@ -427,7 +432,7 @@ def _background_build() -> None:
             if not line:
                 continue
             if line.startswith("[STATUS]"):
-                socketio.emit("progress", {"message": line.split("]", 1)[1].strip()})
+                _emit_log(line.split("]", 1)[1].strip())
                 continue
             if line.startswith("[ROUTE_STEP]"):
                 payload = line.split("]", 1)[1].strip()
@@ -449,29 +454,26 @@ def _background_build() -> None:
                     )
                 continue
             if line.startswith("[ROUTE_DONE]"):
-                socketio.emit("progress", {"message": line})
+                _emit_log(line)
                 socketio.emit("tractor_done", {})
                 continue
             lowered = line.lower()
             for key, msg in stage_keywords.items():
                 if key in lowered:
-                    socketio.emit("progress", {"message": msg})
+                    _emit_log(msg)
                     break
-            socketio.emit("progress", {"message": line})
+            _emit_log(line)
         code = process.wait()
         if code == 0:
-            socketio.emit("progress", {"message": f"[{_timestamp()}] ✅ Маршруты построены"})
+            _emit_log(f"[{_timestamp()}] [DONE] ✅ Маршруты построены")
             socketio.emit("build_done", {"success": True})
             if ROUTES_KML.exists():
                 socketio.emit("routes_ready", {})
         else:
-            socketio.emit(
-                "progress",
-                {"message": f"[{_timestamp()}] ❌ Ошибка subprocess ({code})"},
-            )
+            _emit_log(f"[{_timestamp()}] [ERROR] ❌ Ошибка subprocess ({code})")
             socketio.emit("build_done", {"success": False})
     except Exception as exc:
-        socketio.emit("progress", {"message": f"Ошибка запуска: {exc}"})
+        _emit_log(f"[{_timestamp()}] [ERROR] Ошибка запуска: {exc}")
         socketio.emit("build_done", {"success": False})
     finally:
         global _build_thread
@@ -494,6 +496,12 @@ def on_connect():
         socketio.emit("grid_error", {"message": _grid_error})
     else:
         socketio.emit("grid_error", {"message": None})
+        if GRID_PATH.exists():
+            try:
+                data = json.loads(GRID_PATH.read_text(encoding="utf-8"))
+                socketio.emit("grid_ready", {"cells": len(data.get("features", []))})
+            except Exception:
+                pass
 
 
 @socketio.on("assign_sector")

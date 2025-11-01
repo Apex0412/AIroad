@@ -5,7 +5,7 @@ import json
 import math
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 from lxml import etree
 from shapely.geometry import MultiPolygon, Polygon, box, shape
@@ -69,11 +69,14 @@ def _load_kml_boundary(text: str) -> MultiPolygon:
                     polygons.append(_ensure_valid(poly))
 
     if not polygons:
-        tags = sorted({etree.QName(elem).localname for elem in root.iter()})
+        counts = _collect_tag_counts(root)
         snippet = text[:200].replace("\n", " ").strip()
+        found = ", ".join(
+            f"{tag}: {count}" for tag, count in list(counts.items())[:10]
+        ) or "тегов не найдено"
         raise ValueError(
-            "Не удалось извлечь полигоны из GEO.kml. "
-            f"Найдены теги: {', '.join(tags[:20])}. Фрагмент: {snippet}"
+            "GEO.kml не содержит полигонов. "
+            f"Найдено: {found}. Фрагмент: {snippet}"
         )
 
     union = unary_union(polygons)
@@ -125,6 +128,14 @@ def _coords_from_element(element: etree._Element) -> List[Tuple[float, float]]:
     if coords and coords[0] != coords[-1]:
         coords.append(coords[0])
     return coords
+
+
+def _collect_tag_counts(root: etree._Element) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for elem in root.iter():
+        tag = etree.QName(elem).localname
+        counts[tag] = counts.get(tag, 0) + 1
+    return counts
 
 
 def _ensure_valid(polygon: Polygon) -> Polygon:

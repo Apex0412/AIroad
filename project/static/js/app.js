@@ -6,15 +6,23 @@ const state = {
   mode: initialSettings.mode || 'grid',
   advanced: Boolean(initialSettings.advanced),
   streetSource: initialSettings.street_source || 'google',
+  building: false,
 };
 
-const map = L.map('map').setView([initialSettings.center_lat, initialSettings.center_lon], 13);
+const map = L.map('map', { zoomControl: false }).setView(
+  [initialSettings.center_lat, initialSettings.center_lon],
+  13,
+);
+L.control.zoom({ position: 'bottomright' }).addTo(map);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
-  attribution: '&copy; OpenStreetMap contributors'
+  attribution: '&copy; OpenStreetMap contributors',
 }).addTo(map);
 
+const spinner = document.getElementById('spinner');
+const gridMeta = document.getElementById('grid-meta');
 const advancedToggle = document.querySelector('input[name="advanced"]');
+const logEl = document.getElementById('log');
 
 const sectorLayers = new Map();
 const routeLayers = new Map();
@@ -24,19 +32,33 @@ let roadsLayer = null;
 
 const socket = io();
 
+function setSpinner(active) {
+  state.building = active;
+  spinner.classList.toggle('active', active);
+}
+
+function classifyMessage(message) {
+  if (!message) return 'info';
+  const text = message.toLowerCase();
+  if (text.includes('error') || text.includes('ошибка') || text.includes('❌')) return 'error';
+  if (text.includes('⚠️') || text.includes('warn')) return 'warn';
+  if (text.includes('✅') || text.includes('готов') || text.includes('done') || text.includes('[done]')) return 'success';
+  return 'info';
+}
+
 function appendLog(message) {
-  const logEl = document.getElementById('log');
   const time = new Date().toLocaleTimeString();
-  const color = message.includes('Ошибка') || message.includes('❌') ? '#f87171'
-    : message.includes('✅') ? '#4ade80'
-    : message.includes('🚀') ? '#60a5fa'
-    : '#e2e8f0';
-  const div = document.createElement('div');
-  div.style.color = color;
-  div.textContent = `[${time}] ${message}`;
-  logEl.appendChild(div);
+  const entry = document.createElement('div');
+  entry.className = `log-entry ${classifyMessage(message)}`;
+  entry.innerHTML = `<strong>[${time}]</strong> ${message}`;
+  logEl.appendChild(entry);
   logEl.scrollTop = logEl.scrollHeight;
 }
+
+document.getElementById('clear-log').addEventListener('click', () => {
+  logEl.innerHTML = '';
+  appendLog('🧾 Лог очищен');
+});
 
 function buildTractors() {
   state.tractors = [];
@@ -65,8 +87,20 @@ function getTractorById(id) {
 
 function styleForTractor(id) {
   const tractor = getTractorById(id);
-  if (!tractor) return { color: '#64748b', fillColor: '#0f172a' };
-  return { color: '#94a3b8', fillColor: tractor.color };
+  if (!tractor) return { color: '#94a3b8', fillColor: '#1f2937' };
+  return { color: '#cbd5f5', fillColor: tractor.color };
+}
+
+function updateLayerTooltip(layer, sectorId, tractorId) {
+  const tractor = getTractorById(tractorId);
+  if (!tractor) {
+    layer.unbindTooltip();
+    return;
+  }
+  layer.bindTooltip(
+    `${tractor.name}<br>Сектор: ${sectorId}`,
+    { sticky: true, opacity: 0.85 },
+  );
 }
 
 function applyAssignment(sectorId, tractorId) {
@@ -74,7 +108,13 @@ function applyAssignment(sectorId, tractorId) {
   const layer = sectorLayers.get(sectorId);
   if (layer) {
     const style = styleForTractor(tractorId);
-    layer.setStyle({ color: style.color, fillColor: style.fillColor, fillOpacity: 0.45 });
+    layer.setStyle({
+      color: style.color,
+      fillColor: style.fillColor,
+      fillOpacity: 0.45,
+      weight: 1.5,
+    });
+    updateLayerTooltip(layer, sectorId, tractorId);
   }
 }
 
@@ -82,10 +122,24 @@ function resetAssignments() {
   Object.keys(state.assignments).forEach((sectorId) => {
     const layer = sectorLayers.get(sectorId);
     if (layer) {
-      layer.setStyle({ color: '#475569', fillColor: '#1f2937', fillOpacity: 0.2 });
+      layer.setStyle({ color: '#1e3352', fillColor: '#10213b', fillOpacity: 0.18, weight: 1 });
+      layer.unbindTooltip();
     }
   });
   state.assignments = {};
+}
+
+function highlightLayer(layer, tractorId) {
+  const style = styleForTractor(tractorId);
+  layer.setStyle({ color: style.color, weight: 2.5 });
+}
+
+function resetHighlight(layer, tractorId) {
+  const style = styleForTractor(tractorId);
+  layer.setStyle({
+    color: tractorId ? style.color : '#1e3352',
+    weight: 1,
+  });
 }
 
 function loadGrid() {
@@ -105,14 +159,16 @@ function loadGrid() {
       resetAssignments();
       sectorLayers.clear();
       window.gridLayer = L.geoJSON(data, {
+        style: { color: '#1e3352', weight: 1, fillOpacity: 0.18, fillColor: '#10213b' },
         onEachFeature(feature, layer) {
           const { id } = feature.properties;
-          layer.setStyle({ color: '#475569', weight: 1, fillOpacity: 0.2 });
           layer.on('click', () => {
             if (!state.currentTractor) return;
             applyAssignment(id, state.currentTractor);
             socket.emit('assign_sector', { sector_id: id, tractor_id: state.currentTractor });
           });
+          layer.on('mouseover', () => highlightLayer(layer, state.assignments[id]));
+          layer.on('mouseout', () => resetHighlight(layer, state.assignments[id]));
           sectorLayers.set(id, layer);
         },
       }).addTo(map);
@@ -120,7 +176,7 @@ function loadGrid() {
         map.fitBounds(window.gridLayer.getBounds());
       }
     })
-    .catch((err) => appendLog(err.message));
+    .catch((err) => appendLog(`[GRID ERROR] ${err.message}`));
 }
 
 function loadRoads() {
@@ -135,19 +191,19 @@ function loadRoads() {
       }
       roadLayers.clear();
       roadsLayer = L.geoJSON(data, {
-        style: { color: '#94a3b8', weight: 2 },
+        style: { color: '#64748b', weight: 2 },
         onEachFeature(feature, layer) {
           roadLayers.set(feature.properties.id, layer);
+          layer.bindTooltip(feature.properties.name || 'Без названия', { opacity: 0.8 });
         },
       }).addTo(map);
     })
-    .catch(() => appendLog('Дороги не загружены'));
+    .catch(() => appendLog('[ROADS] ⚠️ Дороги не загружены'));
 }
 
 function submitSettings() {
-  const gridCells = Number(document.getElementById('grid-cells').value || initialSettings.grid_cells);
   const payload = {
-    grid_cells: gridCells,
+    grid_cells: Number(document.getElementById('grid-cells').value || initialSettings.grid_cells),
     n_units: Number(document.getElementById('n-units').value || initialSettings.n_units),
     target_km: Number(document.getElementById('target-km').value || initialSettings.target_km),
     travel_mode: document.getElementById('travel-mode').value,
@@ -169,10 +225,11 @@ function submitSettings() {
     .then((res) => res.json())
     .then((data) => {
       if (data.error) throw new Error(data.error);
-      appendLog('Настройки обновлены');
+      appendLog('[SETTINGS] Настройки обновлены');
       loadGrid();
+      buildTractors();
     })
-    .catch((err) => appendLog(`Ошибка настроек: ${err.message}`));
+    .catch((err) => appendLog(`[SETTINGS ERROR] ${err.message}`));
 }
 
 function autoAssign() {
@@ -185,24 +242,28 @@ function autoAssign() {
     .then((res) => res.json())
     .then((data) => {
       if (data.error) throw new Error(data.error);
-      appendLog(`Автораспределение завершено (${data.assigned})`);
+      appendLog(`🔀 Автораспределение завершено (${data.assigned})`);
       if (Array.isArray(data.summary)) {
         data.summary.forEach((item) => {
-          appendLog(`${item.tractor}: ${item.cells} клеток, ${item.area_km2.toFixed(2)} км², дорог ${Math.round(item.roads_m)} м`);
+          appendLog(`[ASSIGN] ${item.tractor}: ${item.cells} клеток, ${item.area_km2.toFixed(2)} км², дорог ${Math.round(item.roads_m)} м`);
         });
       }
     })
-    .catch((err) => appendLog(`Ошибка автораспределения: ${err.message}`));
+    .catch((err) => appendLog(`[ASSIGN ERROR] ${err.message}`));
 }
 
 function buildRoutes() {
-  appendLog('🚀 Старт построения маршрутов');
+  appendLog('🚀 Запуск построения маршрутов');
+  setSpinner(true);
   fetch('/build_routes', { method: 'POST' })
     .then((res) => res.json())
     .then((data) => {
       if (data.error) throw new Error(data.error);
     })
-    .catch((err) => appendLog(`Ошибка запуска маршрутов: ${err.message}`));
+    .catch((err) => {
+      appendLog(`[ROUTE ERROR] ${err.message}`);
+      setSpinner(false);
+    });
 }
 
 function downloadKml() {
@@ -214,9 +275,9 @@ function clearRoutes() {
     .then((res) => res.json())
     .then((data) => {
       if (data.error) throw new Error(data.error);
-      appendLog('Маршруты очищены');
+      appendLog('[ROUTE] Маршруты очищены');
     })
-    .catch((err) => appendLog(`Ошибка очистки маршрутов: ${err.message}`));
+    .catch((err) => appendLog(`[ROUTE ERROR] ${err.message}`));
 }
 
 socket.on('settings', (payload) => {
@@ -242,18 +303,17 @@ socket.on('settings', (payload) => {
   if (state.tractors.length !== initialSettings.n_units) {
     buildTractors();
   }
-  map.setView([initialSettings.center_lat, initialSettings.center_lon], map.getZoom());
 });
 
 socket.on('assignments', (data) => {
   resetAssignments();
   Object.entries(data).forEach(([sectorId, tractorId]) => applyAssignment(sectorId, tractorId));
-  appendLog('Назначения обновлены');
+  appendLog('[ASSIGN] Назначения обновлены');
 });
 
 socket.on('roads_assignment', (data) => {
-  appendLog('Назначения дорог обновлены');
-  roadLayers.forEach((layer) => layer.setStyle({ color: '#94a3b8', weight: 2 }));
+  appendLog('[ASSIGN] Назначения дорог обновлены');
+  roadLayers.forEach((layer) => layer.setStyle({ color: '#64748b', weight: 2 }));
   Object.entries(data).forEach(([roadId, tractorId]) => {
     const layer = roadLayers.get(roadId);
     if (!layer) return;
@@ -263,7 +323,14 @@ socket.on('roads_assignment', (data) => {
   });
 });
 
-socket.on('progress', (data) => appendLog(data.message));
+function handleLogEvent(data) {
+  if (data && data.message) {
+    appendLog(data.message);
+  }
+}
+
+socket.on('progress', handleLogEvent);
+socket.on('log', handleLogEvent);
 
 socket.on('route_step', (data) => {
   const { tractor_id: tractorId, coords } = data;
@@ -290,6 +357,7 @@ socket.on('clear_routes', () => {
 });
 
 socket.on('routes_ready', () => {
+  setSpinner(false);
   fetch('/routes_grid.kml')
     .then((res) => res.text())
     .then((kmlText) => {
@@ -303,17 +371,41 @@ socket.on('routes_ready', () => {
     });
 });
 
+socket.on('build_done', (data) => {
+  setSpinner(false);
+  if (!data?.success) {
+    appendLog('[ROUTE ERROR] Построение завершилось с ошибкой');
+  }
+});
+
+socket.on('grid_ready', (data) => {
+  if (data && typeof data.cells === 'number') {
+    gridMeta.textContent = `Сетка: ${data.cells}`;
+  }
+});
+
 socket.on('grid_error', (payload) => {
   if (!payload || !payload.message) {
-    appendLog('Сетка готова к работе');
+    appendLog('[GRID] Сетка готова к работе');
     return;
   }
-  appendLog(`Ошибка сетки: ${payload.message}`);
+  gridMeta.textContent = 'Сетка: —';
+  appendLog(`[GRID ERROR] ${payload.message}`);
 });
 
 buildTractors();
 loadGrid();
 loadRoads();
+
+if (gridError) {
+  appendLog(`[GRID ERROR] ${gridError}`);
+}
+if (!hasGoogleKey) {
+  appendLog('⚠️ GOOGLE_MAPS_API_KEY не найден — маршруты будут строиться прямыми линиями');
+}
+if (!hasYandexKey) {
+  appendLog('ℹ️ YANDEX_GEOCODER_API_KEY отсутствует, выбирайте источник Google');
+}
 
 document.getElementById('tractor-select').addEventListener('change', (event) => {
   state.currentTractor = event.target.value;
@@ -321,11 +413,15 @@ document.getElementById('tractor-select').addEventListener('change', (event) => 
 
 document.getElementById('clear-selected').addEventListener('click', () => {
   const target = state.currentTractor;
+  if (!target) return;
   Object.entries(state.assignments).forEach(([sectorId, tractorId]) => {
     if (tractorId === target) {
       delete state.assignments[sectorId];
       const layer = sectorLayers.get(sectorId);
-      if (layer) layer.setStyle({ color: '#475569', fillColor: '#1f2937', fillOpacity: 0.2 });
+      if (layer) {
+        layer.setStyle({ color: '#1e3352', fillColor: '#10213b', fillOpacity: 0.18, weight: 1 });
+        layer.unbindTooltip();
+      }
     }
   });
   socket.emit('assignments_reset', { tractor_id: target });
@@ -349,27 +445,20 @@ document.getElementById('apply-settings').addEventListener('click', submitSettin
 Array.from(document.querySelectorAll('input[name="mode"]')).forEach((el) => {
   el.addEventListener('change', () => {
     state.mode = el.value;
+    appendLog(`[MODE] Переключено на ${state.mode === 'grid' ? 'сетку' : 'дороги'}`);
   });
 });
 
 if (advancedToggle) {
   advancedToggle.addEventListener('change', () => {
     state.advanced = advancedToggle.checked;
+    appendLog(`[ADVANCED] ${state.advanced ? 'Включено' : 'Отключено'}`);
   });
 }
 
 Array.from(document.querySelectorAll('input[name="street-source"]')).forEach((el) => {
   el.addEventListener('change', () => {
     state.streetSource = el.value;
+    appendLog(`[STREET] Источник улиц: ${state.streetSource}`);
   });
 });
-
-if (gridError) {
-  appendLog(`Ошибка сетки: ${gridError}`);
-}
-if (!hasGoogleKey) {
-  appendLog('⚠️ GOOGLE_MAPS_API_KEY не найден — маршруты будут строиться прямыми линиями');
-}
-if (!hasYandexKey) {
-  appendLog('ℹ️ YANDEX_GEOCODER_API_KEY отсутствует, выбирайте источник Google');
-}

@@ -2,62 +2,101 @@
 <html lang="ru">
   <head>
     <meta charset="utf-8">
-    <title>Диспетчеризация тракторов</title>
+    <title>AIroad Dispatcher</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
   </head>
   <body>
     <div id="container">
       <aside id="sidebar">
+        <div id="brand">
+          <div class="logo">AI</div>
+          <span>AIroad · Диспетчер уборки</span>
+        </div>
         {% if grid_error %}
         <div class="alert">⚠️ {{ grid_error }}</div>
         {% endif %}
-        <div class="badge">Google API: {{ '✅' if has_google_key else '⚠️' }}</div>
-        <div class="badge">Yandex API: {{ '✅' if has_yandex_key else '⚠️' }}</div>
-        <label for="tractor-select">Трактор</label>
-        <select id="tractor-select"></select>
-        <div class="toggle-group">
-          <label><input type="radio" name="mode" value="grid" {{ 'checked' if settings.mode == 'grid' else '' }}>Сетка</label>
-          <label><input type="radio" name="mode" value="road" {{ 'checked' if settings.mode == 'road' else '' }}>Дороги</label>
+        <div class="status-row">
+          <div class="badge {{ 'success' if has_google_key else 'warn' }}">Google API {{ 'OK' if has_google_key else 'нет' }}</div>
+          <div class="badge {{ 'success' if has_yandex_key else 'warn' }}">Yandex {{ 'OK' if has_yandex_key else 'нет' }}</div>
         </div>
-        <label><input type="checkbox" name="advanced" {{ 'checked' if settings.advanced else '' }}> Advanced Optimization</label>
-        <div class="toggle-group">
-          <label><input type="radio" name="street-source" value="google" {{ 'checked' if settings.street_source == 'google' else '' }}>Google</label>
-          <label><input type="radio" name="street-source" value="yandex" {{ 'checked' if settings.street_source == 'yandex' else '' }}>Yandex</label>
+        <div class="panel">
+          <h2>Управление</h2>
+          <div class="field-group">
+            <label for="tractor-select">Трактор</label>
+            <select id="tractor-select"></select>
+          </div>
+          <div class="toggle-row">
+            <div class="toggle">
+              <label>Режим сетки</label>
+              <input type="radio" name="mode" value="grid" {{ 'checked' if settings.mode == 'grid' else '' }}>
+            </div>
+            <div class="toggle">
+              <label>Режим дорог</label>
+              <input type="radio" name="mode" value="road" {{ 'checked' if settings.mode == 'road' else '' }}>
+            </div>
+          </div>
+          <div class="toggle-row">
+            <div class="toggle">
+              <label>Advanced</label>
+              <input type="checkbox" name="advanced" {{ 'checked' if settings.advanced else '' }}>
+            </div>
+            <div class="toggle">
+              <label>Google</label>
+              <input type="radio" name="street-source" value="google" {{ 'checked' if settings.street_source == 'google' else '' }}>
+            </div>
+            <div class="toggle">
+              <label>Yandex</label>
+              <input type="radio" name="street-source" value="yandex" {{ 'checked' if settings.street_source == 'yandex' else '' }}>
+            </div>
+          </div>
+          <div class="field-group">
+            <label for="grid-cells">Количество клеток</label>
+            <input id="grid-cells" type="number" min="16" max="400" value="{{ settings.grid_cells }}">
+            <label for="n-units">Количество тракторов</label>
+            <input id="n-units" type="number" min="1" max="64" value="{{ settings.n_units }}">
+            <label for="target-km">Целевая длина маршрута (м)</label>
+            <input id="target-km" type="number" min="1000" max="100000" step="500" value="{{ settings.target_km }}">
+            <label for="travel-mode">Travel mode</label>
+            <select id="travel-mode">
+              <option value="driving" {{ 'selected' if settings.travel_mode == 'driving' else '' }}>Driving</option>
+              <option value="walking" {{ 'selected' if settings.travel_mode == 'walking' else '' }}>Walking</option>
+              <option value="bicycling" {{ 'selected' if settings.travel_mode == 'bicycling' else '' }}>Bicycling</option>
+            </select>
+            <label for="max-waypoints">Максимум waypoint</label>
+            <input id="max-waypoints" type="number" min="5" max="25" value="{{ settings.max_waypoints }}">
+            <label class="toggle"><span>Стартовать с базы</span><input type="checkbox" id="use-base-start" {{ 'checked' if settings.use_base_as_start else '' }}></label>
+            <label for="base-lat">Base lat</label>
+            <input id="base-lat" type="number" step="0.000001" value="{{ settings.base_lat }}">
+            <label for="base-lon">Base lon</label>
+            <input id="base-lon" type="number" step="0.000001" value="{{ settings.base_lon }}">
+            <label for="center-lat">Center lat</label>
+            <input id="center-lat" type="number" step="0.000001" value="{{ settings.center_lat }}">
+            <label for="center-lon">Center lon</label>
+            <input id="center-lon" type="number" step="0.000001" value="{{ settings.center_lon }}">
+          </div>
+          <div class="button-grid">
+            <button class="secondary" id="apply-settings">💾 Сохранить сетку</button>
+            <button class="secondary" id="clear-selected">🧼 Очистить трактор</button>
+            <button class="secondary" id="reset-all">♻️ Сбросить всё</button>
+            <button class="secondary" id="auto-assign">🔀 Авто-раздать районы</button>
+            <button class="secondary" id="clear-routes">🧹 Очистить маршруты</button>
+            <button class="primary" id="save-build">🧭 Построить маршруты</button>
+            <button class="success" id="download-kml">⬇️ Скачать KML</button>
+            <button class="warning" id="clear-log">🧾 Очистить лог</button>
+          </div>
         </div>
-        <label for="grid-cells">Количество клеток</label>
-        <input id="grid-cells" type="number" min="16" max="400" value="{{ settings.grid_cells }}">
-        <label for="n-units">Количество тракторов</label>
-        <input id="n-units" type="number" min="1" max="64" value="{{ settings.n_units }}">
-        <label for="target-km">Целевая длина маршрута (м)</label>
-        <input id="target-km" type="number" min="1000" max="100000" step="500" value="{{ settings.target_km }}">
-        <label for="travel-mode">Travel mode</label>
-        <select id="travel-mode">
-          <option value="driving" {{ 'selected' if settings.travel_mode == 'driving' else '' }}>Driving</option>
-          <option value="walking" {{ 'selected' if settings.travel_mode == 'walking' else '' }}>Walking</option>
-          <option value="bicycling" {{ 'selected' if settings.travel_mode == 'bicycling' else '' }}>Bicycling</option>
-        </select>
-        <label for="max-waypoints">Максимум waypoint</label>
-        <input id="max-waypoints" type="number" min="5" max="25" value="{{ settings.max_waypoints }}">
-        <label><input type="checkbox" id="use-base-start" {{ 'checked' if settings.use_base_as_start else '' }}> Стартовать с базы</label>
-        <label for="base-lat">Base lat</label>
-        <input id="base-lat" type="number" step="0.000001" value="{{ settings.base_lat }}">
-        <label for="base-lon">Base lon</label>
-        <input id="base-lon" type="number" step="0.000001" value="{{ settings.base_lon }}">
-        <label for="center-lat">Center lat</label>
-        <input id="center-lat" type="number" step="0.000001" value="{{ settings.center_lat }}">
-        <label for="center-lon">Center lon</label>
-        <input id="center-lon" type="number" step="0.000001" value="{{ settings.center_lon }}">
-        <button class="secondary" id="apply-settings">Сохранить сетку</button>
-        <button class="secondary" id="clear-selected">Очистить у выбранного</button>
-        <button class="secondary" id="reset-all">Сбросить всё</button>
-        <button class="secondary" id="auto-assign">🔀 Авто-раздать смежные районы</button>
-        <button class="secondary" id="clear-routes">♻️ Очистить маршруты</button>
-        <button class="primary" id="save-build">💾 Сохранить и построить</button>
-        <button class="secondary" id="download-kml">⬇️ Скачать KML</button>
-        <div id="log"></div>
+        <div id="log-container">
+          <div id="log-header">
+            <h2>Лог</h2>
+            <div class="badge" id="grid-meta">Сетка: —</div>
+          </div>
+          <div id="log"></div>
+        </div>
       </aside>
-      <main id="map"></main>
+      <main id="map">
+        <div id="spinner"></div>
+      </main>
     </div>
     <script>
       const initialSettings = {{ settings|tojson }};
